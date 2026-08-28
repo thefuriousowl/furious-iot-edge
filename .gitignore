@@ -1,0 +1,77 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Rust/WASM frontend build artifacts
+/dist/
+/web/dashboard/dist/
+/web/dashboard/pkg/
+
+# Operating system metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+.direnv/
+/config/secrets/
+/certs/private/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+
+# SQLite databases and journals
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Runtime data, logs, and process files
+/data/
+/runtime/
+/logs/
+/tmp/
+*.log
+*.pid
+
+# Database backups and local exports
+*.backup
+*.dump
+
+# Coverage and profiling output
+/coverage/
+lcov.info
+*.profraw
+*.profdata
+
+# Temporary files
+*.bak
+*.tmp
