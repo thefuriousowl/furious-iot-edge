@@ -4,18 +4,35 @@ enum MbapError {
     PduTooLarge { actual: usize, maximum: usize },
 }
 
-const MBAP_HEADER_LEN: usize = 7;
-
-fn encode_mbap_header(transaction_id: u16, length: u16, unit_id: u8) -> [u8; MBAP_HEADER_LEN] {
-    let mut header = [0_u8; MBAP_HEADER_LEN];
-    let transaction_bytes = transaction_id.to_be_bytes();
-    header[0..2].copy_from_slice(&transaction_bytes);
-    let length_bytes = length.to_be_bytes();
-    header[4..6].copy_from_slice(&length_bytes);
-    header[6] = unit_id;
-
-    header
+struct MbapHeader {
+    transaction_id: u16,
+    length: u16,
+    unit_id: u8,
 }
+
+impl MbapHeader {
+    fn new(transaction_id: u16, unit_id: u8, pdu_len: usize) -> Result<Self, MbapError> {
+        let length = pdu_len_to_mbap_len(pdu_len)?;
+        Ok(Self {
+            transaction_id,
+            length,
+            unit_id,
+        })
+    }
+
+    fn encode(&self) -> [u8; MBAP_HEADER_LEN] {
+        let mut header = [0_u8; MBAP_HEADER_LEN];
+        let transaction_bytes = self.transaction_id.to_be_bytes();
+        header[0..2].copy_from_slice(&transaction_bytes);
+        let length_bytes = self.length.to_be_bytes();
+        header[4..6].copy_from_slice(&length_bytes);
+        header[6] = self.unit_id;
+
+        header
+    }
+}
+
+const MBAP_HEADER_LEN: usize = 7;
 
 const MIN_PDU_LEN: usize = 1;
 const MAX_PDU_LEN: usize = 253;
@@ -54,15 +71,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_valid_mbap_header() {
+    fn encodes_valid_mbap_header() -> Result<(), MbapError> {
         let transaction_id = 0x1234;
-        let length = 0x0006;
+        let pdu_len = 0x0005;
         let unit_id = 0x11;
-
-        let actual = encode_mbap_header(transaction_id, length, unit_id);
+        let mbap_header = MbapHeader::new(transaction_id, unit_id, pdu_len)?;
+        let actual = mbap_header.encode();
         let expected: [u8; 7] = [0x12, 0x34, 0x00, 0x00, 0x00, 0x06, 0x11];
 
         assert_eq!(actual, expected);
+
+        Ok(())
     }
 
     #[test]
@@ -79,8 +98,19 @@ mod tests {
             pdu_len_to_mbap_len(254),
             Err(MbapError::PduTooLarge {
                 actual: 254,
-                maximum: MAX_PDU_LEN
+                maximum: MAX_PDU_LEN,
             })
-        )
+        );
+        assert!(matches!(
+            MbapHeader::new(0x1234, 0x11, 0),
+            Err(MbapError::EmptyPdu)
+        ));
+        assert!(matches!(
+            MbapHeader::new(0x1234, 0x11, 254),
+            Err(MbapError::PduTooLarge {
+                actual: 254,
+                maximum: MAX_PDU_LEN,
+            })
+        ))
     }
 }
