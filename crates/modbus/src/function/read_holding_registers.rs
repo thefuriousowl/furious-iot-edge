@@ -11,6 +11,34 @@ pub(crate) enum Fc03Error {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Fc03ResponseError {
+    OddByteLength {
+        actual: u8,
+    },
+    RegisterCountMismatch {
+        actual: u16,
+        expected: u16,
+    },
+    PduTooShort {
+        actual: usize,
+        minimum: usize,
+    },
+    UnexpectedFunctionCode {
+        actual: u8,
+        expected: u8,
+    },
+    ExpectedQuantityOutOfRange {
+        actual: u16,
+        minimum: u16,
+        maximum: u16,
+    },
+    PduLengthMismatch {
+        actual: usize,
+        expected: usize,
+    },
+}
+
 pub(crate) struct ReadHoldingRegistersRequest {
     start_address: u16,
     quantity: u16,
@@ -19,6 +47,7 @@ pub(crate) struct ReadHoldingRegistersRequest {
 const MINIMUM_QUANTITY: u16 = 1;
 const MAXIMUM_QUANTITY: u16 = 125;
 const FC03_FUNCTION_CODE: u8 = 0x03;
+const FC03_RESPONSE_PREFIX_LENGTH: usize = 2;
 
 impl ReadHoldingRegistersRequest {
     pub(crate) fn new(start_address: u16, quantity: u16) -> Result<Self, Fc03Error> {
@@ -56,6 +85,63 @@ impl ReadHoldingRegistersRequest {
         let [qty_hi, qty_lo] = self.quantity.to_be_bytes();
         [FC03_FUNCTION_CODE, start_hi, start_lo, qty_hi, qty_lo]
     }
+}
+
+fn decode_fc03_response(pdu: &[u8], expected_quantity: u16) -> Result<Vec<u16>, Fc03ResponseError> {
+    if !(MINIMUM_QUANTITY..=MAXIMUM_QUANTITY).contains(&expected_quantity) {
+        return Err(Fc03ResponseError::ExpectedQuantityOutOfRange {
+            actual: expected_quantity,
+            minimum: MINIMUM_QUANTITY,
+            maximum: MAXIMUM_QUANTITY,
+        });
+    }
+
+    if pdu.len() < FC03_RESPONSE_PREFIX_LENGTH {
+        return Err(Fc03ResponseError::PduTooShort {
+            actual: pdu.len(),
+            minimum: FC03_RESPONSE_PREFIX_LENGTH,
+        });
+    }
+
+    if pdu[0] != FC03_FUNCTION_CODE {
+        return Err(Fc03ResponseError::UnexpectedFunctionCode {
+            actual: pdu[0],
+            expected: FC03_FUNCTION_CODE,
+        });
+    }
+
+    let data_length = usize::from(pdu[1]);
+    let expected_pdu_length = FC03_RESPONSE_PREFIX_LENGTH + data_length;
+
+    if pdu.len() != expected_pdu_length {
+        return Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: expected_pdu_length,
+        });
+    }
+
+    if !data_length.is_multiple_of(2) {
+        return Err(Fc03ResponseError::OddByteLength { actual: pdu[1] });
+    }
+
+    let actual_quantity = u16::from(pdu[1]) / 2;
+
+    if actual_quantity != expected_quantity {
+        return Err(Fc03ResponseError::RegisterCountMismatch {
+            actual: actual_quantity,
+            expected: expected_quantity,
+        });
+    }
+
+    let mut registers = Vec::with_capacity(usize::from(expected_quantity));
+    let (pairs, _remainder) = pdu[FC03_RESPONSE_PREFIX_LENGTH..].as_chunks::<2>();
+
+    for pair in pairs {
+        let value = u16::from_be_bytes([pair[0], pair[1]]);
+        registers.push(value);
+    }
+
+    Ok(registers)
 }
 
 #[cfg(test)]
@@ -108,5 +194,146 @@ mod tests {
             })
         );
         assert!(ReadHoldingRegistersRequest::new(u16::MAX, 1).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_fc03_response() {
+        let pdu: [u8; 8] = [0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00, 0x64];
+        let expected: Result<Vec<u16>, Fc03ResponseError> = Ok(vec![0x022b, 0x0000, 0x0064]);
+        let actual = decode_fc03_response(&pdu, 3);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_empty_pdu() {
+        let pdu = [];
+        let expected = Err(Fc03ResponseError::PduTooShort {
+            actual: pdu.len(),
+            minimum: FC03_RESPONSE_PREFIX_LENGTH,
+        });
+        let actual = decode_fc03_response(&pdu, 2);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_one_byte_pdu() {
+        let pdu = [0x00];
+        let expected = Err(Fc03ResponseError::PduTooShort {
+            actual: pdu.len(),
+            minimum: FC03_RESPONSE_PREFIX_LENGTH,
+        });
+        let actual = decode_fc03_response(&pdu, 2);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_unexpected_fc() {
+        let pdu = [0x04, 0x02, 0x00, 0x01];
+        let expected = Err(Fc03ResponseError::UnexpectedFunctionCode {
+            actual: pdu[0],
+            expected: FC03_FUNCTION_CODE,
+        });
+        let actual = decode_fc03_response(&pdu, 1);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_zero_quantity() {
+        let pdu: [u8; 2] = [0x03, 0x00];
+        let expected_quantity = 0;
+        let expected: Result<_, Fc03ResponseError> =
+            Err(Fc03ResponseError::ExpectedQuantityOutOfRange {
+                actual: expected_quantity,
+                minimum: MINIMUM_QUANTITY,
+                maximum: MAXIMUM_QUANTITY,
+            });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_upper_bound_qty_exceed() {
+        let pdu = [0x03, 0x02, 0x00, 0x01];
+        let expected_quantity = 126;
+        let expected = Err(Fc03ResponseError::ExpectedQuantityOutOfRange {
+            actual: expected_quantity,
+            minimum: MINIMUM_QUANTITY,
+            maximum: MAXIMUM_QUANTITY,
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_odd_bytes_count() {
+        let pdu = [0x03, 0x03, 0x00, 0x01, 0x02];
+        let expected_quantity = 1;
+        let expected = Err(Fc03ResponseError::OddByteLength { actual: pdu[1] });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_pdu_length_mismatch() {
+        let pdu = [0x03, 0x06, 0x02, 0x2b];
+        let expected_quantity: u16 = 3;
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_RESPONSE_PREFIX_LENGTH + usize::from(pdu[1]),
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_trailing_byte_after_declared_data() {
+        let pdu = [0x03, 0x02, 0x00, 0x01, 0xff];
+        let expected_quantity = 1;
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_RESPONSE_PREFIX_LENGTH + usize::from(pdu[1]),
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_pdu_register_count_mismatch() {
+        let pdu = [0x03, 0x02, 0x00, 0x01];
+        let expected_quantity = 2;
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let expected = Err(Fc03ResponseError::RegisterCountMismatch {
+            actual: 1,
+            expected: expected_quantity,
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn accepts_minimum_response_quantity() {
+        let pdu = [0x03, 0x02, 0x12, 0x34];
+        let expected_quantity = 1;
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let expected = Ok(vec![0x1234]);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn accepts_maximum_response_quantity() {
+        let mut pdu: Vec<u8> = vec![0x03, 0xfa];
+        for _ in 0..MAXIMUM_QUANTITY {
+            pdu.push(0x12);
+            pdu.push(0x34);
+        }
+
+        let expected = Ok(vec![0x1234; usize::from(MAXIMUM_QUANTITY)]);
+
+        assert_eq!(decode_fc03_response(&pdu, MAXIMUM_QUANTITY), expected);
     }
 }
