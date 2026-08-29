@@ -2,7 +2,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "used by a production request assembler in a later reviewed slice"
+        reason = "used through the private request assembler by a production TCP client in a later reviewed slice"
     )
 )]
-mod read_holding_registers;
+pub(crate) mod read_holding_registers;

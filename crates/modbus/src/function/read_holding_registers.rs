@@ -1,5 +1,5 @@
 #[derive(Debug, PartialEq, Eq)]
-enum Fc03Error {
+pub(crate) enum Fc03Error {
     QuantityOutOfRange {
         actual: u16,
         minimum: u16,
@@ -11,7 +11,7 @@ enum Fc03Error {
     },
 }
 
-struct ReadHoldingRegistersRequest {
+pub(crate) struct ReadHoldingRegistersRequest {
     start_address: u16,
     quantity: u16,
 }
@@ -21,7 +21,7 @@ const MAXIMUM_QUANTITY: u16 = 125;
 const FC03_FUNCTION_CODE: u8 = 0x03;
 
 impl ReadHoldingRegistersRequest {
-    fn new(start_address: u16, quantity: u16) -> Result<Self, Fc03Error> {
+    pub(crate) fn new(start_address: u16, quantity: u16) -> Result<Self, Fc03Error> {
         if !(MINIMUM_QUANTITY..=MAXIMUM_QUANTITY).contains(&quantity) {
             return Err(Fc03Error::QuantityOutOfRange {
                 actual: quantity,
@@ -51,7 +51,7 @@ impl ReadHoldingRegistersRequest {
         })
     }
 
-    fn encode(&self) -> [u8; 5] {
+    pub(crate) fn encode(&self) -> [u8; 5] {
         let [start_hi, start_lo] = self.start_address.to_be_bytes();
         let [qty_hi, qty_lo] = self.quantity.to_be_bytes();
         [FC03_FUNCTION_CODE, start_hi, start_lo, qty_hi, qty_lo]

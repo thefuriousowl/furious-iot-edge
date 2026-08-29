@@ -1,17 +1,17 @@
 #[derive(Debug, PartialEq, Eq)]
-enum MbapError {
+pub(super) enum MbapError {
     EmptyPdu,
     PduTooLarge { actual: usize, maximum: usize },
 }
 
-struct MbapHeader {
+pub(super) struct MbapHeader {
     transaction_id: u16,
     length: u16,
     unit_id: u8,
 }
 
 impl MbapHeader {
-    fn new(transaction_id: u16, unit_id: u8, pdu_len: usize) -> Result<Self, MbapError> {
+    pub(super) fn new(transaction_id: u16, unit_id: u8, pdu_len: usize) -> Result<Self, MbapError> {
         let length = pdu_len_to_mbap_len(pdu_len)?;
         Ok(Self {
             transaction_id,
@@ -20,7 +20,7 @@ impl MbapHeader {
         })
     }
 
-    fn encode(&self) -> [u8; MBAP_HEADER_LEN] {
+    pub(super) fn encode(&self) -> [u8; MBAP_HEADER_LEN] {
         let mut header = [0_u8; MBAP_HEADER_LEN];
         let transaction_bytes = self.transaction_id.to_be_bytes();
         header[0..2].copy_from_slice(&transaction_bytes);
@@ -33,7 +33,6 @@ impl MbapHeader {
 }
 
 const MBAP_HEADER_LEN: usize = 7;
-
 const MIN_PDU_LEN: usize = 1;
 const MAX_PDU_LEN: usize = 253;
 const UNIT_IDENTIFIER_SIZE: usize = 1;
@@ -43,6 +42,7 @@ fn pdu_len_to_mbap_len(pdu_len: usize) -> Result<u16, MbapError> {
         return Err(MbapError::EmptyPdu);
     }
 
+    // validate pdu length must not exceed 253
     if pdu_len > MAX_PDU_LEN {
         return Err(MbapError::PduTooLarge {
             actual: pdu_len,
