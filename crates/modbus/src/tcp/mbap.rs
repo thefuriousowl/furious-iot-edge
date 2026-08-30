@@ -32,7 +32,7 @@ impl MbapHeader {
     }
 }
 
-const MBAP_HEADER_LEN: usize = 7;
+pub(super) const MBAP_HEADER_LEN: usize = 7;
 const MIN_PDU_LEN: usize = 1;
 const MAX_PDU_LEN: usize = 253;
 const UNIT_IDENTIFIER_SIZE: usize = 1;
