@@ -1,3 +1,6 @@
+use crate::function::read_holding_registers::{
+    Fc03Response, Fc03ResponseError, decode_fc03_response,
+};
 use crate::tcp::mbap::MBAP_HEADER_LEN;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +30,12 @@ enum TcpResponseError {
         actual: u8,
         expected: u8,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Fc03TcpResponseError {
+    Frame(TcpResponseError),
+    Pdu(Fc03ResponseError),
 }
 
 const MIN_MBAP_LENGTH: u16 = 2;
@@ -90,9 +99,21 @@ fn decode_response_adu(
     Ok(&adu[MBAP_HEADER_LEN..])
 }
 
+fn decode_fc03_response_adu(
+    adu: &[u8],
+    expected_transaction_id: u16,
+    expected_unit_id: u8,
+    expected_quantity: u16,
+) -> Result<Fc03Response, Fc03TcpResponseError> {
+    let pdu = decode_response_adu(adu, expected_transaction_id, expected_unit_id)
+        .map_err(Fc03TcpResponseError::Frame)?;
+    decode_fc03_response(pdu, expected_quantity).map_err(Fc03TcpResponseError::Pdu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::function::read_holding_registers::Fc03Exception;
 
     #[test]
     fn accepts_valid_adu() {
@@ -225,7 +246,7 @@ mod tests {
         let mut maximum_adu = vec![
             0x12, 0x34, // Transaction ID
             0x00, 0x00, // Protocol ID
-            0x00, 0xFE, // Length = 254
+            0x00, 0xfe, // Length = 254
             0x11, // Unit ID
         ];
 
@@ -298,6 +319,101 @@ mod tests {
             0x11,
         );
 
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn accepts_valid_fc03_response_adu() {
+        let valid_adu = [
+            0x12, 0x34, 0x00, 0x00, 0x00, 0x09, 0x11, 0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00,
+            0x64,
+        ];
+        let expected = Ok(Fc03Response::Registers(vec![0x022b, 0x0000, 0x0064]));
+        let actual = decode_fc03_response_adu(&valid_adu, 0x1234, 0x11, 3);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn maps_unsupported_protocol_id_to_frame_error() {
+        let invalid_protocol_id_adu = [
+            0x12, 0x34, 0x00, 0x01, 0x00, 0x09, 0x11, 0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00,
+            0x64,
+        ];
+        let expected = Err(Fc03TcpResponseError::Frame(
+            TcpResponseError::UnsupportedProtocolId {
+                actual: 0x0001,
+                expected: 0x0000,
+            },
+        ));
+        let actual = decode_fc03_response_adu(&invalid_protocol_id_adu, 0x1234, 0x11, 3);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn maps_transaction_id_mismatch_to_frame_error() {
+        let invalid_transaction_id_adu = [
+            0x12, 0x35, 0x00, 0x00, 0x00, 0x09, 0x11, 0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00,
+            0x64,
+        ];
+        let expected = Err(Fc03TcpResponseError::Frame(
+            TcpResponseError::TransactionIdMismatch {
+                actual: 0x1235,
+                expected: 0x1234,
+            },
+        ));
+        let actual = decode_fc03_response_adu(&invalid_transaction_id_adu, 0x1234, 0x11, 0x03);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn returns_frame_error_before_malformed_pdu_error() {
+        let invalid_protocol_id_adu = [0x12, 0x34, 0x00, 0x01, 0x00, 0x02, 0x11, 0x03];
+
+        let expected = Err(Fc03TcpResponseError::Frame(
+            TcpResponseError::UnsupportedProtocolId {
+                actual: 0x0001,
+                expected: 0x0000,
+            },
+        ));
+        let actual = decode_fc03_response_adu(&invalid_protocol_id_adu, 0x1234, 0x11, 0x03);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn accepts_valid_modbus_exception_adu() {
+        let valid_modbus_exception_adu = [0x12, 0x34, 0x00, 0x00, 0x00, 0x03, 0x11, 0x83, 0x02];
+        let expected = Ok(Fc03Response::Exception(Fc03Exception::IllegalDataAddress));
+        let actual = decode_fc03_response_adu(&valid_modbus_exception_adu, 0x1234, 0x11, 0x03);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn maps_unexpected_function_code_to_pdu_error() {
+        let invalid_function_code_adu = [
+            0x12, 0x34, 0x00, 0x00, 0x00, 0x05, 0x11, 0x04, 0x02, 0x00, 0x01,
+        ];
+        let expected = Err(Fc03TcpResponseError::Pdu(
+            Fc03ResponseError::UnexpectedFunctionCode {
+                actual: 0x04,
+                expected: 0x03,
+            },
+        ));
+        let actual = decode_fc03_response_adu(&invalid_function_code_adu, 0x1234, 0x11, 0x01);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn maps_register_count_mismatch_to_pdu_error() {
+        let register_count_mismatch_adu = [
+            0x12, 0x34, 0x00, 0x00, 0x00, 0x05, 0x11, 0x03, 0x02, 0x00, 0x01,
+        ];
+        let expected = Err(Fc03TcpResponseError::Pdu(
+            Fc03ResponseError::RegisterCountMismatch {
+                actual: 1,
+                expected: 2,
+            },
+        ));
+        let actual = decode_fc03_response_adu(&register_count_mismatch_adu, 0x1234, 0x11, 2);
         assert_eq!(actual, expected);
     }
 }

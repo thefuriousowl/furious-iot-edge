@@ -12,7 +12,7 @@ pub(crate) enum Fc03Error {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Fc03ResponseError {
+pub(crate) enum Fc03ResponseError {
     OddByteLength {
         actual: u8,
     },
@@ -43,13 +43,13 @@ enum Fc03ResponseError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Fc03Response {
+pub(crate) enum Fc03Response {
     Registers(Vec<u16>),
     Exception(Fc03Exception),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Fc03Exception {
+pub(crate) enum Fc03Exception {
     IllegalFunction,
     IllegalDataAddress,
     IllegalDataValue,
@@ -105,7 +105,7 @@ impl ReadHoldingRegistersRequest {
     }
 }
 
-fn decode_fc03_response(
+pub(crate) fn decode_fc03_response(
     pdu: &[u8],
     expected_quantity: u16,
 ) -> Result<Fc03Response, Fc03ResponseError> {
