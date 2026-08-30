@@ -37,8 +37,24 @@ enum Fc03ResponseError {
         actual: usize,
         expected: usize,
     },
+    UnknownExceptionCode {
+        actual: u8,
+    },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Fc03Response {
+    Registers(Vec<u16>),
+    Exception(Fc03Exception),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Fc03Exception {
+    IllegalFunction,
+    IllegalDataAddress,
+    IllegalDataValue,
+    ServerDeviceFailure,
+}
 pub(crate) struct ReadHoldingRegistersRequest {
     start_address: u16,
     quantity: u16,
@@ -46,8 +62,10 @@ pub(crate) struct ReadHoldingRegistersRequest {
 
 const MINIMUM_QUANTITY: u16 = 1;
 const MAXIMUM_QUANTITY: u16 = 125;
+const FC03_EXCEPTION_FUNCTION_CODE: u8 = 0x83;
 const FC03_FUNCTION_CODE: u8 = 0x03;
 const FC03_RESPONSE_PREFIX_LENGTH: usize = 2;
+const FC03_EXCEPTION_PDU_LENGTH: usize = 2;
 
 impl ReadHoldingRegistersRequest {
     pub(crate) fn new(start_address: u16, quantity: u16) -> Result<Self, Fc03Error> {
@@ -87,7 +105,23 @@ impl ReadHoldingRegistersRequest {
     }
 }
 
-fn decode_fc03_response(pdu: &[u8], expected_quantity: u16) -> Result<Vec<u16>, Fc03ResponseError> {
+fn decode_fc03_response(
+    pdu: &[u8],
+    expected_quantity: u16,
+) -> Result<Fc03Response, Fc03ResponseError> {
+    if pdu.first() == Some(&FC03_EXCEPTION_FUNCTION_CODE) {
+        let exception_decoded = decode_fc03_exception_response(pdu);
+        exception_decoded.map(Fc03Response::Exception)
+    } else {
+        let decoded = decode_fc03_success_response(pdu, expected_quantity);
+        decoded.map(Fc03Response::Registers)
+    }
+}
+
+fn decode_fc03_success_response(
+    pdu: &[u8],
+    expected_quantity: u16,
+) -> Result<Vec<u16>, Fc03ResponseError> {
     if !(MINIMUM_QUANTITY..=MAXIMUM_QUANTITY).contains(&expected_quantity) {
         return Err(Fc03ResponseError::ExpectedQuantityOutOfRange {
             actual: expected_quantity,
@@ -142,6 +176,30 @@ fn decode_fc03_response(pdu: &[u8], expected_quantity: u16) -> Result<Vec<u16>, 
     }
 
     Ok(registers)
+}
+
+fn decode_fc03_exception_response(pdu: &[u8]) -> Result<Fc03Exception, Fc03ResponseError> {
+    if pdu.len() != FC03_EXCEPTION_PDU_LENGTH {
+        return Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_EXCEPTION_PDU_LENGTH,
+        });
+    }
+
+    if pdu[0] != FC03_EXCEPTION_FUNCTION_CODE {
+        return Err(Fc03ResponseError::UnexpectedFunctionCode {
+            actual: pdu[0],
+            expected: FC03_EXCEPTION_FUNCTION_CODE,
+        });
+    }
+
+    match pdu[1] {
+        0x01 => Ok(Fc03Exception::IllegalFunction),
+        0x02 => Ok(Fc03Exception::IllegalDataAddress),
+        0x03 => Ok(Fc03Exception::IllegalDataValue),
+        0x04 => Ok(Fc03Exception::ServerDeviceFailure),
+        actual => Err(Fc03ResponseError::UnknownExceptionCode { actual }),
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +258,7 @@ mod tests {
     fn accepts_valid_fc03_response() {
         let pdu: [u8; 8] = [0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00, 0x64];
         let expected: Result<Vec<u16>, Fc03ResponseError> = Ok(vec![0x022b, 0x0000, 0x0064]);
-        let actual = decode_fc03_response(&pdu, 3);
+        let actual = decode_fc03_success_response(&pdu, 3);
 
         assert_eq!(actual, expected);
     }
@@ -212,7 +270,7 @@ mod tests {
             actual: pdu.len(),
             minimum: FC03_RESPONSE_PREFIX_LENGTH,
         });
-        let actual = decode_fc03_response(&pdu, 2);
+        let actual = decode_fc03_success_response(&pdu, 2);
         assert_eq!(actual, expected);
     }
 
@@ -223,7 +281,7 @@ mod tests {
             actual: pdu.len(),
             minimum: FC03_RESPONSE_PREFIX_LENGTH,
         });
-        let actual = decode_fc03_response(&pdu, 2);
+        let actual = decode_fc03_success_response(&pdu, 2);
 
         assert_eq!(actual, expected);
     }
@@ -235,7 +293,7 @@ mod tests {
             actual: pdu[0],
             expected: FC03_FUNCTION_CODE,
         });
-        let actual = decode_fc03_response(&pdu, 1);
+        let actual = decode_fc03_success_response(&pdu, 1);
         assert_eq!(actual, expected);
     }
 
@@ -249,7 +307,7 @@ mod tests {
                 minimum: MINIMUM_QUANTITY,
                 maximum: MAXIMUM_QUANTITY,
             });
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
         assert_eq!(actual, expected);
     }
 
@@ -262,7 +320,7 @@ mod tests {
             minimum: MINIMUM_QUANTITY,
             maximum: MAXIMUM_QUANTITY,
         });
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
 
         assert_eq!(actual, expected);
     }
@@ -272,7 +330,7 @@ mod tests {
         let pdu = [0x03, 0x03, 0x00, 0x01, 0x02];
         let expected_quantity = 1;
         let expected = Err(Fc03ResponseError::OddByteLength { actual: pdu[1] });
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
 
         assert_eq!(actual, expected);
     }
@@ -285,7 +343,7 @@ mod tests {
             actual: pdu.len(),
             expected: FC03_RESPONSE_PREFIX_LENGTH + usize::from(pdu[1]),
         });
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
         assert_eq!(actual, expected);
     }
 
@@ -297,7 +355,7 @@ mod tests {
             actual: pdu.len(),
             expected: FC03_RESPONSE_PREFIX_LENGTH + usize::from(pdu[1]),
         });
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
         assert_eq!(actual, expected);
     }
 
@@ -305,7 +363,7 @@ mod tests {
     fn rejects_pdu_register_count_mismatch() {
         let pdu = [0x03, 0x02, 0x00, 0x01];
         let expected_quantity = 2;
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
         let expected = Err(Fc03ResponseError::RegisterCountMismatch {
             actual: 1,
             expected: expected_quantity,
@@ -318,7 +376,7 @@ mod tests {
     fn accepts_minimum_response_quantity() {
         let pdu = [0x03, 0x02, 0x12, 0x34];
         let expected_quantity = 1;
-        let actual = decode_fc03_response(&pdu, expected_quantity);
+        let actual = decode_fc03_success_response(&pdu, expected_quantity);
         let expected = Ok(vec![0x1234]);
 
         assert_eq!(actual, expected);
@@ -334,6 +392,150 @@ mod tests {
 
         let expected = Ok(vec![0x1234; usize::from(MAXIMUM_QUANTITY)]);
 
-        assert_eq!(decode_fc03_response(&pdu, MAXIMUM_QUANTITY), expected);
+        assert_eq!(
+            decode_fc03_success_response(&pdu, MAXIMUM_QUANTITY),
+            expected
+        );
+    }
+
+    #[test]
+    fn decodes_illegal_data_address_exception() {
+        let pdu = [0x83, 0x02];
+        let expected = Ok(Fc03Exception::IllegalDataAddress);
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_empty_exception_pdu() {
+        let pdu = [];
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_EXCEPTION_PDU_LENGTH,
+        });
+        let actual = decode_fc03_exception_response(&pdu);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_one_byte_exception_pdu() {
+        let pdu = [0x83];
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_EXCEPTION_PDU_LENGTH,
+        });
+        let actual = decode_fc03_exception_response(&pdu);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_trailing_byte_in_exception_pdu() {
+        let pdu = [0x83, 0x02, 0xff];
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: pdu.len(),
+            expected: FC03_EXCEPTION_PDU_LENGTH,
+        });
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_wrong_exception_function_code() {
+        let pdu = [0x84, 0x02];
+        let expected = Err(Fc03ResponseError::UnexpectedFunctionCode {
+            actual: pdu[0],
+            expected: FC03_EXCEPTION_FUNCTION_CODE,
+        });
+        let actual = decode_fc03_exception_response(&pdu);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decodes_illegal_function_exception() {
+        let pdu = [0x83, 0x01];
+        let expected = Ok(Fc03Exception::IllegalFunction);
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decodes_illegal_data_value_exception() {
+        let pdu = [0x83, 0x03];
+        let expected = Ok(Fc03Exception::IllegalDataValue);
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decodes_server_device_failure_exception() {
+        let pdu = [0x83, 0x04];
+        let expected = Ok(Fc03Exception::ServerDeviceFailure);
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_unknown_exception_code() {
+        let pdu = [0x83, 0x07];
+        let expected = Err(Fc03ResponseError::UnknownExceptionCode { actual: pdu[1] });
+        let actual = decode_fc03_exception_response(&pdu);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decodes_success_response_through_outer_decoder() {
+        let pdu = [0x03, 0x02, 0x12, 0x34];
+        let expected_quantity = 1;
+        let expected = Ok(Fc03Response::Registers(vec![0x1234]));
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn decodes_exception_response_through_outer_decoder() {
+        let pdu = [0x83, 0x02];
+        let expected_quantity = 1;
+        let expected = Ok(Fc03Response::Exception(Fc03Exception::IllegalDataAddress));
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_empty_pdu_through_outer_decoder() {
+        let pdu = [];
+        let expected_quantity = 1;
+        let expected = Err(Fc03ResponseError::PduTooShort {
+            actual: 0,
+            minimum: FC03_RESPONSE_PREFIX_LENGTH,
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_truncated_exception_through_outer_decoder() {
+        let pdu = [0x83];
+        let expected_quantity = 1;
+        let expected = Err(Fc03ResponseError::PduLengthMismatch {
+            actual: 1,
+            expected: FC03_EXCEPTION_PDU_LENGTH,
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_unrelated_function_code_through_outer_decoder() {
+        let pdu = [0x84, 0x02];
+        let expected_quantity = 1;
+        let expected = Err(Fc03ResponseError::UnexpectedFunctionCode {
+            actual: 0x84,
+            expected: FC03_FUNCTION_CODE,
+        });
+        let actual = decode_fc03_response(&pdu, expected_quantity);
+        assert_eq!(actual, expected);
     }
 }
