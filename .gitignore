@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Rust compiler crash reports
+rustc-ice-*.txt
+
+# Environment / local configuration
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Coverage / profiling
+*.profraw
+/llvm-cov-target/
+/coverage/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*~
