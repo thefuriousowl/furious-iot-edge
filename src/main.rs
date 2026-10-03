@@ -241,13 +241,12 @@ fn main() -> std::io::Result<()> {
     let mut session = ModbusSession::connect("127.0.0.1:10502").expect("good");
     let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("should be valid");
     loop {
-        match session.execute(&operation)? {
-            ModbusResponse::Registers { data, count } => {
-                println!("Registers: {:?}", &data[..count]);
-            }
-            ModbusResponse::Exception(exception) => {
-                println!("Modbus exception: {exception:?}");
-            }
+        let response = session.execute(&operation)?;
+
+        if let Some(registers) = response.registers() {
+            println!("Registers: {registers:?}");
+        } else if let Some(exception) = response.exception() {
+            println!("Modbus exception: {exception:?}");
         }
 
         sleep(Duration::from_secs(1));
@@ -279,6 +278,22 @@ pub(crate) enum ModbusResponse {
     Exception(ModbusException),
 }
 
+impl ModbusResponse {
+    pub(crate) fn registers(&self) -> Option<&[u16]> {
+        match self {
+            Self::Registers { data, count } => Some(&data[..*count]),
+            Self::Exception(_) => None,
+        }
+    }
+
+    pub(crate) fn exception(&self) -> Option<ModbusException> {
+        match self {
+            Self::Exception(exception) => Some(*exception),
+            Self::Registers { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -286,7 +301,7 @@ mod tests {
         net::TcpListener,
     };
 
-    use crate::{ModbusOperation, ModbusSession};
+    use crate::{ModbusException, ModbusOperation, ModbusSession};
     #[test]
     fn valid_fc03_round_trip() {
         let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
@@ -333,13 +348,92 @@ mod tests {
             server_stream
                 .write_all(&response_adu)
                 .expect("server should write response");
-            server_stream.flush().expect("should flush server_stream");
         });
 
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
         let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation");
-        session.execute(&operation).expect("execute should succeed");
+        let modbus_response = session.execute(&operation).expect("should succeed");
+        assert_eq!(modbus_response.registers(), Some(&[10u16, 20][..]));
+
+        server_thread
+            .join()
+            .expect("server thread panicked or failed");
+    }
+
+    #[test]
+    fn exception_then_valid_fc03_on_same_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+        let server_addr = server.local_addr().expect("should get local address");
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut server_stream, _) = server.accept().expect("server should accept connection");
+            let mut expected_request = [
+                0x00, 0x00, // TID: 0
+                0x00, 0x00, // PID: 0
+                0x00, 0x06, // MBAP Length
+                0x01, // Unit ID
+                0x03, // FC03
+                0x00, 0x00, // Starting address
+                0x00, 0x02, // Quantity
+            ];
+            let mut request = [0u8; 12];
+
+            // First Transaction: read request then response the exception
+            server_stream
+                .read_exact(&mut request)
+                .expect("server should read first request");
+            assert_eq!(request, expected_request);
+
+            let exception_response_adu = [
+                0x00, 0x00, // TID: 0
+                0x00, 0x00, // PID: 0
+                0x00, 0x03, // Unit ID + exception PDU
+                0x01, // Unit ID
+                0x83, 0x02, // FC03 exception: Illegal Data Address
+            ];
+
+            server_stream
+                .write_all(&exception_response_adu)
+                .expect("server should write exception response");
+
+            // Next transaction: waiting request on the same stream
+            expected_request[1] = 0x01; // TID change to 1
+            server_stream
+                .read_exact(&mut request)
+                .expect("server should read second request");
+            assert_eq!(request, expected_request);
+
+            let normal_response_adu = [
+                0x00, 0x01, // TID: 1
+                0x00, 0x00, // PID: 0
+                0x00, 0x07, // MBAP Length
+                0x01, // Unit ID
+                0x03, 0x04, // FC03 + Byte Count
+                0x00, 0x0a, // Register: 10
+                0x00, 0x14, // Register: 20
+            ];
+            server_stream
+                .write_all(&normal_response_adu)
+                .expect("server should write normal response");
+        });
+        let mut session =
+            ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
+        let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation");
+        let response = session
+            .execute(&operation)
+            .expect("valid exception should be a protocol outcome");
+
+        assert_eq!(
+            response.exception(),
+            Some(ModbusException::IllegalDataAddress)
+        );
+
+        let response = session
+            .execute(&operation)
+            .expect("second transaction should succeed");
+
+        assert_eq!(response.registers(), Some(&[10u16, 20][..]));
 
         server_thread
             .join()
