@@ -299,6 +299,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
+        thread,
     };
 
     use crate::{ModbusException, ModbusOperation, ModbusSession};
@@ -308,27 +309,16 @@ mod tests {
         let server_addr = server.local_addr().expect("should get local address");
         // 12-byte Modbus TCP Request ADU (FC03 Read Holding Registers)
         // Transaction ID (2B), Protocol ID (2B), Length (2B), Unit ID (1B), FC (1B), Start Addr (2B), Quantity (2B)
+
+        // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
         let expected_request_adu: [u8; 12] = [
-            0x00, 0x00, // Transaction ID: 0
-            0x00, 0x00, // Protocol ID: 0 (Modbus TCP)
-            0x00, 0x06, // Length: 6 bytes following
-            0x01, // Unit ID: 1
-            0x03, // Function Code: 03 (Read Holding Registers)
-            0x00, 0x00, // Starting Address: 0
-            0x00, 0x02, // Quantity of Registers: 2
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
         ];
 
         // Modbus TCP Response ADU (2 registers = 4 bytes response data)
         // Header (7B) + FC (1B) + Byte Count (1B) + Register Data (4B) = 13 bytes
         let response_adu: [u8; 13] = [
-            0x00, 0x00, // Transaction ID: 0 (Must be matched the Request)
-            0x00, 0x00, // Protocol ID: 0
-            0x00, 0x07, // Length: 7 bytes following (1 Unit ID + 1 FC + 1 ByteCount + 4 Data)
-            0x01, // Unit ID: 1
-            0x03, // Function Code: 03
-            0x04, // Byte Count: 4 bytes (2 registers * 2 bytes)
-            0x00, 0x0a, // Register 0 value: 10
-            0x00, 0x14, // Register 1 value: 20
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
         ];
         let server_thread = std::thread::spawn(move || {
             let (mut server_stream, _) = server.accept().expect("should be ok");
@@ -368,14 +358,9 @@ mod tests {
 
         let server_thread = std::thread::spawn(move || {
             let (mut server_stream, _) = server.accept().expect("server should accept connection");
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
             let mut expected_request = [
-                0x00, 0x00, // TID: 0
-                0x00, 0x00, // PID: 0
-                0x00, 0x06, // MBAP Length
-                0x01, // Unit ID
-                0x03, // FC03
-                0x00, 0x00, // Starting address
-                0x00, 0x02, // Quantity
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
             ];
             let mut request = [0u8; 12];
 
@@ -384,14 +369,8 @@ mod tests {
                 .read_exact(&mut request)
                 .expect("server should read first request");
             assert_eq!(request, expected_request);
-
-            let exception_response_adu = [
-                0x00, 0x00, // TID: 0
-                0x00, 0x00, // PID: 0
-                0x00, 0x03, // Unit ID + exception PDU
-                0x01, // Unit ID
-                0x83, 0x02, // FC03 exception: Illegal Data Address
-            ];
+            // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
+            let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
 
             server_stream
                 .write_all(&exception_response_adu)
@@ -403,15 +382,9 @@ mod tests {
                 .read_exact(&mut request)
                 .expect("server should read second request");
             assert_eq!(request, expected_request);
-
+            // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
             let normal_response_adu = [
-                0x00, 0x01, // TID: 1
-                0x00, 0x00, // PID: 0
-                0x00, 0x07, // MBAP Length
-                0x01, // Unit ID
-                0x03, 0x04, // FC03 + Byte Count
-                0x00, 0x0a, // Register: 10
-                0x00, 0x14, // Register: 20
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
             server_stream
                 .write_all(&normal_response_adu)
@@ -434,6 +407,66 @@ mod tests {
             .expect("second transaction should succeed");
 
         assert_eq!(response.registers(), Some(&[10u16, 20][..]));
+
+        server_thread
+            .join()
+            .expect("server thread panicked or failed");
+    }
+
+    #[test]
+    fn different_fc03_operations_on_same_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+        let server_addr = server.local_addr().expect("should get local address");
+        let server_thread = thread::spawn(move || {
+            let (mut server_stream, _) = server.accept().expect("server should accept connection");
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_from_op_a = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            let mut request_op_a_buf = [0u8; 12];
+            server_stream
+                .read_exact(&mut request_op_a_buf)
+                .expect("server should read request of operation A");
+            assert_eq!(request_op_a_buf, expected_request_from_op_a);
+            // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
+            let expected_response_for_op_a = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+            server_stream
+                .write_all(&expected_response_for_op_a)
+                .expect("server should write operation A response");
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 3, Start: 10, Quantity: 1
+            let expected_request_from_op_b = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x03, 0x00, 0x0a, 0x00, 0x01,
+            ];
+            let mut request_op_b_buf = [0u8; 12];
+            server_stream
+                .read_exact(&mut request_op_b_buf)
+                .expect("server should read request of operation B");
+            assert_eq!(request_op_b_buf, expected_request_from_op_b);
+            // TID: 1, PID: 0, LENGTH: 5, UnitID: 2, FC: 3, ByteCount: 2, Registers: [30]
+            let expected_response_for_op_b = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x03, 0x02, 0x00, 0x1e,
+            ];
+            server_stream
+                .write_all(&expected_response_for_op_b)
+                .expect("server should write operation A response");
+        });
+
+        let mut session =
+            ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
+        let operation_a =
+            ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation A");
+        let op_a_response = session
+            .execute(&operation_a)
+            .expect("valid response should be a protocol outcome");
+        assert_eq!(op_a_response.registers(), Some(&[10u16, 20][..]));
+        let operation_b =
+            ModbusOperation::new(0x02, 0x03, 0x000a, 0x0001).expect("valid operation B");
+        let op_b_response = session
+            .execute(&operation_b)
+            .expect("valid response should be a protocol outcome");
+        assert_eq!(op_b_response.registers(), Some(&[30u16][..]));
 
         server_thread
             .join()
