@@ -15,17 +15,21 @@ The current Modbus TCP prototype supports:
 
 - Persistent TCP sessions
 - Serialized FC03 transactions
+- Caller-owned FC03 operation definitions, borrowed by the session
 - Modbus TCP MBAP framing
 - Transaction ID correlation
 - Protocol ID and Unit ID validation
 - Fixed-size request and response buffers
 - Register decoding without per-poll heap allocation
+- Returned register data and Modbus exception outcomes
+- Preservation of unrecognized exception codes
 
-Operation modeling, response outcomes, additional function codes, scheduling,
-and reconnect behavior are still under development.
+Additional function codes, scheduling, and reconnect behavior are not implemented yet.
 
 ## Development
 
 ```bash
 cargo fmt --check
 cargo test
+cargo clippy --all-targets -- -D warnings
+```
