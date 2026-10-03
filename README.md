@@ -14,17 +14,23 @@ Early development.
 The current Modbus TCP prototype supports:
 
 - Persistent TCP sessions
-- Serialized FC03 transactions
-- Caller-owned FC03 operation definitions, borrowed by the session
+- Serialized FC03 (holding registers) and FC04 (input registers) transactions
+- Caller-owned operation definitions with typed function codes, borrowed by the session
+- Multiple operations with different Unit IDs, function codes, addresses, and quantities on one connection
 - Modbus TCP MBAP framing
 - Transaction ID correlation
-- Protocol ID and Unit ID validation
+- Protocol ID, Unit ID, and response function code validation
 - Fixed-size request and response buffers
 - Register decoding without per-poll heap allocation
 - Returned register data and Modbus exception outcomes
 - Preservation of unrecognized exception codes
 
-Additional function codes, scheduling, and reconnect behavior are not implemented yet.
+Six scripted TCP tests cover request bytes, decoded register values, multiple
+operations on one connection, valid FC03/FC04 exceptions followed by successful
+transactions, and rejection of mismatched normal and exception function codes.
+
+Function codes other than FC03/FC04, scheduling, and reconnect behavior are not
+implemented yet.
 
 ## Development
 

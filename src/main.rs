@@ -10,7 +10,7 @@ const MBAP_HEADER_LEN: usize = 7;
 
 pub(crate) struct ModbusOperation {
     unit_id: u8,
-    function_code: u8,
+    function_code: FunctionCode,
     starting_address: u16,
     quantity: u16,
 }
@@ -18,14 +18,10 @@ pub(crate) struct ModbusOperation {
 impl ModbusOperation {
     pub(crate) fn new(
         unit_id: u8,
-        function_code: u8,
+        function_code: FunctionCode,
         starting_address: u16,
         quantity: u16,
     ) -> Result<Self, String> {
-        if function_code != 0x03 {
-            return Err("Only FC03 supported".to_string());
-        }
-
         if !(1..=125).contains(&quantity) {
             return Err("Quantity must be 1-125".to_string());
         }
@@ -47,7 +43,7 @@ impl ModbusOperation {
         self.unit_id
     }
 
-    pub(crate) fn function_code(&self) -> u8 {
+    pub(crate) fn function_code(&self) -> FunctionCode {
         self.function_code
     }
 
@@ -82,7 +78,7 @@ impl ModbusSession {
         self.next_transaction_id = self.next_transaction_id.wrapping_add(1);
     }
 
-    fn process_fc03_response(
+    fn process_register_response(
         response_pdu: &[u8],
         request_quantity: u16,
         pdu_len: usize,
@@ -153,7 +149,7 @@ impl ModbusSession {
         operation: &ModbusOperation,
     ) -> Result<ModbusResponse, std::io::Error> {
         let mut req_pdu = [0u8; 5];
-        req_pdu[0] = operation.function_code();
+        req_pdu[0] = operation.function_code() as u8;
         req_pdu[1..3].copy_from_slice(&operation.starting_address().to_be_bytes());
         req_pdu[3..5].copy_from_slice(&operation.quantity().to_be_bytes());
 
@@ -218,17 +214,27 @@ impl ModbusSession {
                 "response unit id mismatch from request unit id",
             ));
         }
+        if res_fc != req_pdu[0] && res_fc != (req_pdu[0] | 0x80) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Function code mismatch. expected: {}, got: {}",
+                    req_pdu[0], res_fc
+                ),
+            ));
+        }
 
         match res_fc {
-            0x03 => {
-                let modbus_response = Self::process_fc03_response(
+            0x03 | 0x04 => {
+                let modbus_response = Self::process_register_response(
                     &res_pdu[..pdu_len],
                     operation.quantity(),
                     pdu_len,
                 )?;
                 Ok(modbus_response)
             }
-            0x83 => Self::process_exception(&res_pdu[..pdu_len]),
+
+            0x83 | 0x84 => Self::process_exception(&res_pdu[..pdu_len]),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Unknown FC",
@@ -239,14 +245,27 @@ impl ModbusSession {
 
 fn main() -> std::io::Result<()> {
     let mut session = ModbusSession::connect("127.0.0.1:10502").expect("good");
-    let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("should be valid");
+    let operation_fc03 =
+        ModbusOperation::new(0x01, FunctionCode::ReadHoldingRegisters, 0x0000, 0x0002)
+            .expect("should be valid");
+    let operation_fc04 =
+        ModbusOperation::new(0x02, FunctionCode::ReadInputRegisters, 0x0000, 0x0002)
+            .expect("should be valid");
     loop {
-        let response = session.execute(&operation)?;
+        let response_fc03 = session.execute(&operation_fc03)?;
 
-        if let Some(registers) = response.registers() {
-            println!("Registers: {registers:?}");
-        } else if let Some(exception) = response.exception() {
-            println!("Modbus exception: {exception:?}");
+        if let Some(registers_fc03) = response_fc03.registers() {
+            println!("Registers FC03: {registers_fc03:?}");
+        } else if let Some(exception_fc03) = response_fc03.exception() {
+            println!("Modbus exception: {exception_fc03:?}");
+        }
+
+        let response_fc04 = session.execute(&operation_fc04)?;
+
+        if let Some(registers_fc04) = response_fc04.registers() {
+            println!("Registers FC04: {registers_fc04:?}");
+        } else if let Some(exception_fc04) = response_fc04.exception() {
+            println!("Modbus exception: {exception_fc04:?}");
         }
 
         sleep(Duration::from_secs(1));
@@ -294,15 +313,275 @@ impl ModbusResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum FunctionCode {
+    ReadHoldingRegisters = 0x03,
+    ReadInputRegisters = 0x04,
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::{ModbusException, ModbusOperation, ModbusSession};
     use std::{
         io::{Read, Write},
         net::TcpListener,
         thread,
     };
+    #[test]
+    fn reject_mismatch_fc() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+        let server_addr = server
+            .local_addr()
+            .expect("should get local test server address");
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("should accept client connection");
+            let mut request = [0u8; 12];
+            // read fc04 request
+            stream
+                .read_exact(&mut request)
+                .expect("should read the request");
 
-    use crate::{ModbusException, ModbusOperation, ModbusSession};
+            // but response fc03 adu
+            // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
+            let mismatch_fc03_response_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            stream
+                .write_all(&mismatch_fc03_response_adu)
+                .expect("should write response");
+
+            // read fc03 request
+            stream
+                .read_exact(&mut request)
+                .expect("should read the second request");
+            // but response fc04 adu
+            // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
+            let mismatch_fc04_response_adu = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            stream
+                .write_all(&mismatch_fc04_response_adu)
+                .expect("should write exception");
+
+            // read fc03 request
+            stream
+                .read_exact(&mut request)
+                .expect("should read the third request");
+
+            // but response fc04 exception
+            // TID: 2, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
+            let mismatch_fc04_exception_response_adu =
+                [0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
+
+            stream
+                .write_all(&mismatch_fc04_exception_response_adu)
+                .expect("should write response");
+
+            // read fc04 request
+            stream
+                .read_exact(&mut request)
+                .expect("should read the fourth request");
+
+            // but response fc03 exception
+            // TID: 3, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
+            let mismatch_fc03_exception_response_adu =
+                [0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
+
+            stream
+                .write_all(&mismatch_fc03_exception_response_adu)
+                .expect("should write response");
+        });
+        let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
+            .expect("should be valid fc04 operation");
+        let mut session =
+            ModbusSession::connect(&server_addr.to_string()).expect("should successfully connect");
+        let response = session.execute(&operation_a);
+        match response {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().starts_with("Function code mismatch"),
+                    "unexpected error: {error}"
+                );
+            }
+            Ok(_) => panic!("mismatched FC should be rejected"),
+        }
+
+        let operation_b = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("should be valid fc03 operation");
+        let response = session.execute(&operation_b);
+        match response {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().starts_with("Function code mismatch"),
+                    "unexpected error: {error}"
+                );
+            }
+            Ok(_) => panic!("mismatched FC should be rejected"),
+        }
+
+        let operation_c = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("should be valid fc03 operation");
+        let response = session.execute(&operation_c);
+        match response {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().starts_with("Function code mismatch"),
+                    "unexpected error: {error}"
+                );
+            }
+            Ok(_) => panic!("mismatched FC should be rejected"),
+        }
+
+        let operation_d = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
+            .expect("should be valid fc04 operation");
+        let response = session.execute(&operation_d);
+        match response {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().starts_with("Function code mismatch"),
+                    "unexpected error: {error}"
+                );
+            }
+            Ok(_) => panic!("mismatched FC should be rejected"),
+        }
+
+        server_thread
+            .join()
+            .expect("server thread panicked or failed");
+    }
+    #[test]
+    fn exception_then_valid_fc04_on_same_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("should bund test server");
+        let server_addr = server
+            .local_addr()
+            .expect("should get local server address");
+
+        let server_thread = thread::spawn(move || {
+            let (mut server_stream, _) = server.accept().expect("should accept client connection");
+            let mut request_buf = [0u8; 12];
+            server_stream
+                .read_exact(&mut request_buf)
+                .expect("should read valid request");
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 16, Quantity: 2
+            let mut expected_request = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x02,
+            ];
+            assert_eq!(request_buf, expected_request);
+            // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
+            let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
+            server_stream
+                .write_all(&exception_response_adu)
+                .expect("server should successfully write response");
+            expected_request[1] = 0x01;
+
+            server_stream
+                .read_exact(&mut request_buf)
+                .expect("should read valid request");
+            assert_eq!(expected_request, request_buf);
+            // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
+            let valid_fc04_response_adu = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+            server_stream
+                .write_all(&valid_fc04_response_adu)
+                .expect("server should write normal response");
+        });
+
+        let fc04_operation =
+            ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 16, 2)
+                .expect("should be valid response");
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let response = session
+            .execute(&fc04_operation)
+            .expect("should get exception");
+        assert_eq!(
+            response.exception(),
+            Some(ModbusException::IllegalDataAddress)
+        );
+        assert_eq!(response.registers(), None);
+
+        let response = session
+            .execute(&fc04_operation)
+            .expect("second transaction should get valid registers");
+        assert_eq!(response.registers(), Some(&[10u16, 20][..]));
+        assert_eq!(response.exception(), None);
+        server_thread
+            .join()
+            .expect("server thread panicked or failed");
+    }
+
+    #[test]
+    fn different_fc_operations_on_same_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+        let server_addr = server.local_addr().expect("should get server address");
+
+        let server_thread = thread::spawn(move || {
+            let (mut server_stream, _) = server.accept().expect("should accept connection");
+            let mut buf = [0u8; 12];
+            server_stream
+                .read_exact(&mut buf)
+                .expect("should successfully read request adu");
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_fc03_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            assert_eq!(buf, expected_request_fc03_adu);
+            // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
+            let valid_fc03_response = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            server_stream
+                .write_all(&valid_fc03_response)
+                .expect("should write valid response");
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 4, Start: 0, Quantity: 2
+            server_stream
+                .read_exact(&mut buf)
+                .expect("should read valid response");
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 4, Start: 0, Quantity: 2
+            let expected_request_fc04_adu = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00, 0x02,
+            ];
+            assert_eq!(buf, expected_request_fc04_adu);
+            // TID: 1, PID: 0, LENGTH: 7, UnitID: 2, FC: 4, ByteCount: 4, Registers: [30, 40]
+            let valid_fc04_response = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x02, 0x04, 0x04, 0x00, 0x1e, 0x00, 0x28,
+            ];
+            server_stream
+                .write_all(&valid_fc04_response)
+                .expect("server should write response");
+        });
+
+        let fc03_operation =
+            ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+                .expect("valid operation");
+        let fc04_operation = ModbusOperation::new(2, crate::FunctionCode::ReadInputRegisters, 0, 2)
+            .expect("valid operation");
+
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should successfully connect to server");
+        let fc03_registers = session
+            .execute(&fc03_operation)
+            .expect("valid fc03 registers");
+        let fc04_registers = session
+            .execute(&fc04_operation)
+            .expect("valid fc04 registers");
+
+        server_thread
+            .join()
+            .expect("server thread panicked or failed");
+
+        assert_eq!(fc03_registers.registers(), Some(&[10u16, 20][..]));
+        assert_eq!(fc04_registers.registers(), Some(&[30u16, 40][..]));
+    }
     #[test]
     fn valid_fc03_round_trip() {
         let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
@@ -342,7 +621,13 @@ mod tests {
 
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
-        let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation");
+        let operation = ModbusOperation::new(
+            0x01,
+            crate::FunctionCode::ReadHoldingRegisters,
+            0x0000,
+            0x0002,
+        )
+        .expect("valid operation");
         let modbus_response = session.execute(&operation).expect("should succeed");
         assert_eq!(modbus_response.registers(), Some(&[10u16, 20][..]));
 
@@ -392,7 +677,13 @@ mod tests {
         });
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
-        let operation = ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation");
+        let operation = ModbusOperation::new(
+            0x01,
+            crate::FunctionCode::ReadHoldingRegisters,
+            0x0000,
+            0x0002,
+        )
+        .expect("valid operation");
         let response = session
             .execute(&operation)
             .expect("valid exception should be a protocol outcome");
@@ -455,14 +746,24 @@ mod tests {
 
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
-        let operation_a =
-            ModbusOperation::new(0x01, 0x03, 0x0000, 0x0002).expect("valid operation A");
+        let operation_a = ModbusOperation::new(
+            0x01,
+            crate::FunctionCode::ReadHoldingRegisters,
+            0x0000,
+            0x0002,
+        )
+        .expect("valid operation A");
         let op_a_response = session
             .execute(&operation_a)
             .expect("valid response should be a protocol outcome");
         assert_eq!(op_a_response.registers(), Some(&[10u16, 20][..]));
-        let operation_b =
-            ModbusOperation::new(0x02, 0x03, 0x000a, 0x0001).expect("valid operation B");
+        let operation_b = ModbusOperation::new(
+            0x02,
+            crate::FunctionCode::ReadHoldingRegisters,
+            0x000a,
+            0x0001,
+        )
+        .expect("valid operation B");
         let op_b_response = session
             .execute(&operation_b)
             .expect("valid response should be a protocol outcome");
