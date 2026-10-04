@@ -328,6 +328,7 @@ mod tests {
         net::TcpListener,
         thread,
     };
+    // In ADU summaries, LENGTH is the MBAP Length field (Unit ID + PDU), in bytes.
     fn create_tcp_test_server(
         server_fn: impl FnOnce(std::net::TcpStream) + Send + 'static,
     ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
@@ -371,6 +372,87 @@ mod tests {
             }
             Ok(_) => panic!("expected InvalidData: {expected_message}"),
         }
+    }
+    #[test]
+    fn reject_mismatch_unit_id() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_fc03_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // TID: 0, PID: 0, LENGTH: 7, UnitID: 2, FC: 3, ByteCount: 4, Data: [10, 20]
+            let mismatch_uid_fc03_response = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            serve_exchanges(
+                server_stream,
+                &[(expected_request_fc03_adu, &mismatch_uid_fc03_response)],
+            );
+        });
+
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("valid FC03 operation");
+        let response = session.execute(&operation);
+        assert_invalid_data(response, "response unit id mismatch");
+
+        server_thread.join().expect("server thread panic or failed");
+    }
+    #[test]
+    fn reject_mismatch_protocol_id() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_fc03_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // TID: 0, PID: 1, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
+            let mismatch_pid_fc03_response = [
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            serve_exchanges(
+                server_stream,
+                &[(expected_request_fc03_adu, &mismatch_pid_fc03_response)],
+            );
+        });
+
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("valid FC03 operation");
+        let response = session.execute(&operation);
+        assert_invalid_data(response, "Invalid response protocol id");
+
+        server_thread.join().expect("server thread panic or failed");
+    }
+    #[test]
+    fn reject_mismatch_transaction_id() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_fc03_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
+            let mismatch_tid_fc03_response = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
+
+            serve_exchanges(
+                server_stream,
+                &[(expected_request_fc03_adu, &mismatch_tid_fc03_response)],
+            );
+        });
+
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("valid FC03 operation");
+        let response = session.execute(&operation);
+        assert_invalid_data(response, "response transaction id mismatch");
+
+        server_thread.join().expect("server thread panic or failed");
     }
 
     #[test]
@@ -620,6 +702,7 @@ mod tests {
 
             // Modbus TCP Response ADU (2 registers = 4 bytes response data)
             // Header (7B) + FC (1B) + Byte Count (1B) + Register Data (4B) = 13 bytes
+            // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
             let response_adu: [u8; 13] = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
