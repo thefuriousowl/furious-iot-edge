@@ -328,129 +328,178 @@ mod tests {
         net::TcpListener,
         thread,
     };
-    #[test]
-    fn reject_mismatch_fc() {
+    fn create_tcp_test_server(
+        server_fn: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
         let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
         let server_addr = server
             .local_addr()
             .expect("should get local test server address");
         let server_thread = thread::spawn(move || {
-            let (mut stream, _) = server.accept().expect("should accept client connection");
-            let mut request = [0u8; 12];
-            // read fc04 request
+            let (stream, _) = server.accept().expect("should accept client connection");
+
+            server_fn(stream);
+        });
+        (server_addr, server_thread)
+    }
+
+    fn serve_exchanges(mut stream: std::net::TcpStream, exchanges: &[([u8; 12], &[u8])]) {
+        let mut request = [0u8; 12];
+
+        for (expected_request, response) in exchanges {
             stream
                 .read_exact(&mut request)
-                .expect("should read the request");
+                .expect("should read request");
 
-            // but response fc03 adu
+            assert_eq!(&request, expected_request);
+
+            stream.write_all(response).expect("should write response");
+        }
+    }
+
+    fn assert_invalid_data(
+        response: std::io::Result<crate::ModbusResponse>,
+        expected_message: &str,
+    ) {
+        match response {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().starts_with(expected_message),
+                    "unexpected error: {error}"
+                );
+            }
+            Ok(_) => panic!("expected InvalidData: {expected_message}"),
+        }
+    }
+
+    #[test]
+    fn reject_byte_count_mismatch_quantity() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_first_request_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // Requested quantity: 2 registers (4 data bytes); response Byte Count: 2.
+            // TID: 0, PID: 0, LENGTH: 5, UnitID: 1, FC: 3, ByteCount: 2, Registers: [10]
+            let mismatch_byte_count_response_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x0a,
+            ];
+
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_second_request_adu = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // Response Byte Count: 4; actual response data: 2 bytes (1 register).
+            // TID: 1, PID: 0, LENGTH: 5, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10]
+            let mismatch_data_bytes_len_response_adu = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x04, 0x00, 0x0a,
+            ];
+
+            serve_exchanges(
+                server_stream,
+                &[
+                    (
+                        expected_first_request_adu,
+                        &mismatch_byte_count_response_adu,
+                    ),
+                    (
+                        expected_second_request_adu,
+                        &mismatch_data_bytes_len_response_adu,
+                    ),
+                ],
+            );
+        });
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("valid fc03 request");
+        let response = session.execute(&operation_a);
+        assert_invalid_data(response, "Byte count mismatch");
+
+        let operation_b = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+            .expect("valid fc03 request");
+        let response = session.execute(&operation_b);
+        assert_invalid_data(response, "Byte count mismatch");
+        server_thread.join().expect("server thread panic or failed");
+    }
+    #[test]
+    fn reject_mismatch_fc() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 0, Quantity: 2
+            let expected_first_request = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // request fc04 but response fc03
             // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
             let mismatch_fc03_response_adu = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
-
-            stream
-                .write_all(&mismatch_fc03_response_adu)
-                .expect("should write response");
-
-            // read fc03 request
-            stream
-                .read_exact(&mut request)
-                .expect("should read the second request");
-            // but response fc04 adu
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_second_request = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // request fc03 but response fc04
             // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
             let mismatch_fc04_response_adu = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
-
-            stream
-                .write_all(&mismatch_fc04_response_adu)
-                .expect("should write exception");
-
-            // read fc03 request
-            stream
-                .read_exact(&mut request)
-                .expect("should read the third request");
-
-            // but response fc04 exception
+            // TID: 2, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_third_request = [
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // request fc03 but response fc04 exception
             // TID: 2, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
             let mismatch_fc04_exception_response_adu =
                 [0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
 
-            stream
-                .write_all(&mismatch_fc04_exception_response_adu)
-                .expect("should write response");
-
-            // read fc04 request
-            stream
-                .read_exact(&mut request)
-                .expect("should read the fourth request");
-
-            // but response fc03 exception
+            // TID: 3, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 0, Quantity: 2
+            let expected_forth_request = [
+                0x00, 0x03, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00, 0x02,
+            ];
+            // request fc04 but response fc03 exception
             // TID: 3, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
             let mismatch_fc03_exception_response_adu =
                 [0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
 
-            stream
-                .write_all(&mismatch_fc03_exception_response_adu)
-                .expect("should write response");
+            serve_exchanges(
+                server_stream,
+                &[
+                    (expected_first_request, &mismatch_fc03_response_adu),
+                    (expected_second_request, &mismatch_fc04_response_adu),
+                    (
+                        expected_third_request,
+                        &mismatch_fc04_exception_response_adu,
+                    ),
+                    (
+                        expected_forth_request,
+                        &mismatch_fc03_exception_response_adu,
+                    ),
+                ],
+            );
         });
+
         let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
             .expect("should be valid fc04 operation");
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("should successfully connect");
         let response = session.execute(&operation_a);
-        match response {
-            Err(error) => {
-                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-                assert!(
-                    error.to_string().starts_with("Function code mismatch"),
-                    "unexpected error: {error}"
-                );
-            }
-            Ok(_) => panic!("mismatched FC should be rejected"),
-        }
+        assert_invalid_data(response, "Function code mismatch");
 
         let operation_b = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
             .expect("should be valid fc03 operation");
         let response = session.execute(&operation_b);
-        match response {
-            Err(error) => {
-                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-                assert!(
-                    error.to_string().starts_with("Function code mismatch"),
-                    "unexpected error: {error}"
-                );
-            }
-            Ok(_) => panic!("mismatched FC should be rejected"),
-        }
+        assert_invalid_data(response, "Function code mismatch");
 
         let operation_c = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
             .expect("should be valid fc03 operation");
         let response = session.execute(&operation_c);
-        match response {
-            Err(error) => {
-                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-                assert!(
-                    error.to_string().starts_with("Function code mismatch"),
-                    "unexpected error: {error}"
-                );
-            }
-            Ok(_) => panic!("mismatched FC should be rejected"),
-        }
+        assert_invalid_data(response, "Function code mismatch");
 
         let operation_d = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
             .expect("should be valid fc04 operation");
         let response = session.execute(&operation_d);
-        match response {
-            Err(error) => {
-                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-                assert!(
-                    error.to_string().starts_with("Function code mismatch"),
-                    "unexpected error: {error}"
-                );
-            }
-            Ok(_) => panic!("mismatched FC should be rejected"),
-        }
+        assert_invalid_data(response, "Function code mismatch");
 
         server_thread
             .join()
@@ -458,40 +507,31 @@ mod tests {
     }
     #[test]
     fn exception_then_valid_fc04_on_same_connection() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("should bund test server");
-        let server_addr = server
-            .local_addr()
-            .expect("should get local server address");
-
-        let server_thread = thread::spawn(move || {
-            let (mut server_stream, _) = server.accept().expect("should accept client connection");
-            let mut request_buf = [0u8; 12];
-            server_stream
-                .read_exact(&mut request_buf)
-                .expect("should read valid request");
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
             // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 16, Quantity: 2
-            let mut expected_request = [
+            let expected_first_request = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x02,
             ];
-            assert_eq!(request_buf, expected_request);
+
             // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
             let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
-            server_stream
-                .write_all(&exception_response_adu)
-                .expect("server should successfully write response");
-            expected_request[1] = 0x01;
 
-            server_stream
-                .read_exact(&mut request_buf)
-                .expect("should read valid request");
-            assert_eq!(expected_request, request_buf);
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 16, Quantity: 2
+            let expected_second_request = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x02,
+            ];
             // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
             let valid_fc04_response_adu = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
-            server_stream
-                .write_all(&valid_fc04_response_adu)
-                .expect("server should write normal response");
+
+            serve_exchanges(
+                server_stream,
+                &[
+                    (expected_first_request, &exception_response_adu),
+                    (expected_second_request, &valid_fc04_response_adu),
+                ],
+            );
         });
 
         let fc04_operation =
@@ -520,44 +560,32 @@ mod tests {
 
     #[test]
     fn different_fc_operations_on_same_connection() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-        let server_addr = server.local_addr().expect("should get server address");
-
-        let server_thread = thread::spawn(move || {
-            let (mut server_stream, _) = server.accept().expect("should accept connection");
-            let mut buf = [0u8; 12];
-            server_stream
-                .read_exact(&mut buf)
-                .expect("should successfully read request adu");
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
             // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
             let expected_request_fc03_adu = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
             ];
-            assert_eq!(buf, expected_request_fc03_adu);
             // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
             let valid_fc03_response = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
 
-            server_stream
-                .write_all(&valid_fc03_response)
-                .expect("should write valid response");
-            // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 4, Start: 0, Quantity: 2
-            server_stream
-                .read_exact(&mut buf)
-                .expect("should read valid response");
             // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 4, Start: 0, Quantity: 2
             let expected_request_fc04_adu = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00, 0x02,
             ];
-            assert_eq!(buf, expected_request_fc04_adu);
             // TID: 1, PID: 0, LENGTH: 7, UnitID: 2, FC: 4, ByteCount: 4, Registers: [30, 40]
             let valid_fc04_response = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x02, 0x04, 0x04, 0x00, 0x1e, 0x00, 0x28,
             ];
-            server_stream
-                .write_all(&valid_fc04_response)
-                .expect("server should write response");
+
+            serve_exchanges(
+                server_stream,
+                &[
+                    (expected_request_fc03_adu, &valid_fc03_response),
+                    (expected_request_fc04_adu, &valid_fc04_response),
+                ],
+            );
         });
 
         let fc03_operation =
@@ -584,39 +612,19 @@ mod tests {
     }
     #[test]
     fn valid_fc03_round_trip() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-        let server_addr = server.local_addr().expect("should get local address");
-        // 12-byte Modbus TCP Request ADU (FC03 Read Holding Registers)
-        // Transaction ID (2B), Protocol ID (2B), Length (2B), Unit ID (1B), FC (1B), Start Addr (2B), Quantity (2B)
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+            // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_request_adu: [u8; 12] = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
 
-        // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_adu: [u8; 12] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+            // Modbus TCP Response ADU (2 registers = 4 bytes response data)
+            // Header (7B) + FC (1B) + Byte Count (1B) + Register Data (4B) = 13 bytes
+            let response_adu: [u8; 13] = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+            ];
 
-        // Modbus TCP Response ADU (2 registers = 4 bytes response data)
-        // Header (7B) + FC (1B) + Byte Count (1B) + Register Data (4B) = 13 bytes
-        let response_adu: [u8; 13] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-        let server_thread = std::thread::spawn(move || {
-            let (mut server_stream, _) = server.accept().expect("should be ok");
-            // Read exact 12-byte request
-            let mut buf = [0u8; 12];
-            server_stream
-                .read_exact(&mut buf)
-                .expect("server should read 12-byte request");
-
-            // Assert request bytes
-            assert_eq!(
-                buf, expected_request_adu,
-                "Request ADU does not match expected bytes"
-            );
-
-            // Write valid FC03 response
-            server_stream
-                .write_all(&response_adu)
-                .expect("server should write response");
+            serve_exchanges(server_stream, &[(expected_request_adu, &response_adu)]);
         });
 
         let mut session =
@@ -638,43 +646,32 @@ mod tests {
 
     #[test]
     fn exception_then_valid_fc03_on_same_connection() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-        let server_addr = server.local_addr().expect("should get local address");
-
-        let server_thread = std::thread::spawn(move || {
-            let (mut server_stream, _) = server.accept().expect("server should accept connection");
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
             // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-            let mut expected_request = [
+            let expected_first_request = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
             ];
-            let mut request = [0u8; 12];
-
-            // First Transaction: read request then response the exception
-            server_stream
-                .read_exact(&mut request)
-                .expect("server should read first request");
-            assert_eq!(request, expected_request);
             // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
             let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
 
-            server_stream
-                .write_all(&exception_response_adu)
-                .expect("server should write exception response");
-
-            // Next transaction: waiting request on the same stream
-            expected_request[1] = 0x01; // TID change to 1
-            server_stream
-                .read_exact(&mut request)
-                .expect("server should read second request");
-            assert_eq!(request, expected_request);
+            // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+            let expected_second_request = [
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
             // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
             let normal_response_adu = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
-            server_stream
-                .write_all(&normal_response_adu)
-                .expect("server should write normal response");
+
+            serve_exchanges(
+                server_stream,
+                &[
+                    (expected_first_request, &exception_response_adu),
+                    (expected_second_request, &normal_response_adu),
+                ],
+            );
         });
+
         let mut session =
             ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
         let operation = ModbusOperation::new(
@@ -706,42 +703,31 @@ mod tests {
 
     #[test]
     fn different_fc03_operations_on_same_connection() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-        let server_addr = server.local_addr().expect("should get local address");
-        let server_thread = thread::spawn(move || {
-            let (mut server_stream, _) = server.accept().expect("server should accept connection");
+        let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
             // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
             let expected_request_from_op_a = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
             ];
-            let mut request_op_a_buf = [0u8; 12];
-            server_stream
-                .read_exact(&mut request_op_a_buf)
-                .expect("server should read request of operation A");
-            assert_eq!(request_op_a_buf, expected_request_from_op_a);
             // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
             let expected_response_for_op_a = [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
             ];
-            server_stream
-                .write_all(&expected_response_for_op_a)
-                .expect("server should write operation A response");
             // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 3, Start: 10, Quantity: 1
             let expected_request_from_op_b = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x03, 0x00, 0x0a, 0x00, 0x01,
             ];
-            let mut request_op_b_buf = [0u8; 12];
-            server_stream
-                .read_exact(&mut request_op_b_buf)
-                .expect("server should read request of operation B");
-            assert_eq!(request_op_b_buf, expected_request_from_op_b);
             // TID: 1, PID: 0, LENGTH: 5, UnitID: 2, FC: 3, ByteCount: 2, Registers: [30]
             let expected_response_for_op_b = [
                 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x03, 0x02, 0x00, 0x1e,
             ];
-            server_stream
-                .write_all(&expected_response_for_op_b)
-                .expect("server should write operation A response");
+
+            serve_exchanges(
+                server_stream,
+                &[
+                    (expected_request_from_op_a, &expected_response_for_op_a),
+                    (expected_request_from_op_b, &expected_response_for_op_b),
+                ],
+            );
         });
 
         let mut session =

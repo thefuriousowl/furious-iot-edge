@@ -25,9 +25,11 @@ The current Modbus TCP prototype supports:
 - Returned register data and Modbus exception outcomes
 - Preservation of unrecognized exception codes
 
-Six scripted TCP tests cover request bytes, decoded register values, multiple
+Seven scripted TCP tests cover request bytes, decoded register values, multiple
 operations on one connection, valid FC03/FC04 exceptions followed by successful
-transactions, and rejection of mismatched normal and exception function codes.
+transactions, rejection of mismatched normal and exception function codes, and
+Byte Count mismatches against the requested register quantity or actual response
+data byte length.
 
 Function codes other than FC03/FC04, scheduling, and reconnect behavior are not
 implemented yet.
