@@ -24,12 +24,15 @@ The current Modbus TCP prototype supports:
 - Register decoding without per-poll heap allocation
 - Returned register data and Modbus exception outcomes
 - Preservation of unrecognized exception codes
+- Typed transaction errors with expected/observed values, preserved underlying I/O errors, and `Display` messages
 
-Ten scripted TCP tests cover request bytes, decoded register values, multiple
+Eleven scripted TCP tests cover request bytes, decoded register values, multiple
 operations on one connection, valid FC03/FC04 exceptions followed by successful
 transactions, rejection of mismatched Transaction IDs, invalid Protocol IDs,
 mismatched Unit IDs and normal/exception function codes, and Byte Count mismatches
 against the requested register quantity or actual response data byte length.
+They also verify that a connection closed during an incomplete response PDU
+returns an I/O error with `UnexpectedEof`.
 
 Function codes other than FC03/FC04, scheduling, and reconnect behavior are not
 implemented yet.

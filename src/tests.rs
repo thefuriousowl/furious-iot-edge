@@ -1,4 +1,4 @@
-use crate::{ModbusException, ModbusOperation, ModbusSession};
+use crate::{MB_TCP_PID, ModbusError, ModbusException, ModbusOperation, ModbusSession};
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -33,19 +33,40 @@ fn serve_exchanges(mut stream: std::net::TcpStream, exchanges: &[([u8; 12], &[u8
         stream.write_all(response).expect("should write response");
     }
 }
+#[test]
+fn reject_truncated_response_from_unexpected_connection_close() {
+    let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+        let mut request = [0u8; 12];
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
 
-fn assert_invalid_data(response: std::io::Result<crate::ModbusResponse>, expected_message: &str) {
-    match response {
-        Err(error) => {
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-            assert!(
-                error.to_string().starts_with(expected_message),
-                "unexpected error: {error}"
-            );
-        }
-        Ok(_) => panic!("expected InvalidData: {expected_message}"),
-    }
+        // TID: 0, PID: 0, LENGTH: 7, UnitID: 1
+        // declared 6 bytes PDU but actual sent 4 bytes
+        let incomplete_response = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a,
+        ];
+
+        server_stream
+            .write_all(&incomplete_response)
+            .expect("should write partial response");
+
+        drop(server_stream);
+    });
+
+    let mut session =
+        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 3)
+        .expect("valid fc03 operation");
+    let response = session.execute(&operation);
+    assert!(
+        matches!(response, Err(ModbusError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+    server_thread
+        .join()
+        .expect("server thread panicked or failed");
 }
+
 #[test]
 fn reject_mismatch_unit_id() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
@@ -69,7 +90,13 @@ fn reject_mismatch_unit_id() {
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
-    assert_invalid_data(response, "response unit id mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::UnitIdMismatch {
+            expected: 1,
+            found: 2,
+        })
+    ));
 
     server_thread.join().expect("server thread panic or failed");
 }
@@ -96,8 +123,14 @@ fn reject_mismatch_protocol_id() {
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
-    assert_invalid_data(response, "Invalid response protocol id");
 
+    assert!(matches!(
+        response,
+        Err(ModbusError::InvalidProtocolId {
+            expected: MB_TCP_PID,
+            found: 0x0001,
+        })
+    ));
     server_thread.join().expect("server thread panic or failed");
 }
 #[test]
@@ -123,8 +156,13 @@ fn reject_mismatch_transaction_id() {
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
-    assert_invalid_data(response, "response transaction id mismatch");
-
+    assert!(matches!(
+        response,
+        Err(ModbusError::TransactionIdMismatch {
+            expected: 0x0000,
+            found: 0x0001,
+        })
+    ));
     server_thread.join().expect("server thread panic or failed");
 }
 
@@ -170,12 +208,24 @@ fn reject_byte_count_mismatch_quantity() {
     let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid fc03 request");
     let response = session.execute(&operation_a);
-    assert_invalid_data(response, "Byte count mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::ByteCountMismatched {
+            expected: 4,
+            found: 2,
+        })
+    ));
 
     let operation_b = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid fc03 request");
     let response = session.execute(&operation_b);
-    assert_invalid_data(response, "Byte count mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::ActualDataLenMismatchByteCount {
+            byte_count: 4,
+            data_len: 2,
+        })
+    ));
     server_thread.join().expect("server thread panic or failed");
 }
 #[test]
@@ -239,22 +289,46 @@ fn reject_mismatch_fc() {
     let mut session =
         ModbusSession::connect(&server_addr.to_string()).expect("should successfully connect");
     let response = session.execute(&operation_a);
-    assert_invalid_data(response, "Function code mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::FunctionCodeMismatch {
+            request: 0x04,
+            response: 0x03,
+        })
+    ));
 
     let operation_b = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("should be valid fc03 operation");
     let response = session.execute(&operation_b);
-    assert_invalid_data(response, "Function code mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::FunctionCodeMismatch {
+            request: 0x03,
+            response: 0x04,
+        })
+    ));
 
     let operation_c = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("should be valid fc03 operation");
     let response = session.execute(&operation_c);
-    assert_invalid_data(response, "Function code mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::FunctionCodeMismatch {
+            request: 0x03,
+            response: 0x84,
+        })
+    ));
 
     let operation_d = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
         .expect("should be valid fc04 operation");
     let response = session.execute(&operation_d);
-    assert_invalid_data(response, "Function code mismatch");
+    assert!(matches!(
+        response,
+        Err(ModbusError::FunctionCodeMismatch {
+            request: 0x04,
+            response: 0x83,
+        })
+    ));
 
     server_thread
         .join()

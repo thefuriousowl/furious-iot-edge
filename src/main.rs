@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
     thread::sleep,
     time::Duration,
@@ -82,26 +82,25 @@ impl ModbusSession {
         response_pdu: &[u8],
         request_quantity: u16,
         pdu_len: usize,
-    ) -> Result<ModbusResponse, std::io::Error> {
+    ) -> Result<ModbusResponse, ModbusError> {
         if response_pdu.len() < 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Pdu Truncated",
-            ));
+            return Err(ModbusError::PduTruncated {
+                got_len: response_pdu.len(),
+            });
         }
         let response_byte_count = response_pdu[1];
         if (response_byte_count as u16) != request_quantity * 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Byte count mismatch",
-            ));
+            return Err(ModbusError::ByteCountMismatched {
+                expected: request_quantity * 2,
+                found: response_byte_count as u16,
+            });
         }
         let data_len = pdu_len - 2;
         if (response_byte_count as usize) != data_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Byte count mismatch",
-            ));
+            return Err(ModbusError::ActualDataLenMismatchByteCount {
+                byte_count: response_byte_count as usize,
+                data_len,
+            });
         }
 
         let response_data = &response_pdu[2..pdu_len];
@@ -120,12 +119,12 @@ impl ModbusSession {
         })
     }
 
-    fn process_exception(response_pdu: &[u8]) -> Result<ModbusResponse, std::io::Error> {
+    fn process_exception(response_pdu: &[u8]) -> Result<ModbusResponse, ModbusError> {
         if response_pdu.len() != 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Pdu Truncated",
-            ));
+            return Err(ModbusError::InvalidExceptionPduLen {
+                expected: 2,
+                found: response_pdu.len(),
+            });
         }
         let exception = match response_pdu[1] {
             0x01 => ModbusException::IllegalFunction,
@@ -147,7 +146,7 @@ impl ModbusSession {
     pub(crate) fn execute(
         &mut self,
         operation: &ModbusOperation,
-    ) -> Result<ModbusResponse, std::io::Error> {
+    ) -> Result<ModbusResponse, ModbusError> {
         let mut req_pdu = [0u8; 5];
         req_pdu[0] = operation.function_code() as u8;
         req_pdu[1..3].copy_from_slice(&operation.starting_address().to_be_bytes());
@@ -173,18 +172,16 @@ impl ModbusSession {
 
         let res_length = u16::from_be_bytes([res_mbap[4], res_mbap[5]]);
         if !(2..=254).contains(&res_length) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid MBAP length field",
-            ));
+            return Err(ModbusError::InvalidMbapLength {
+                min: 2,
+                max: 254,
+                found: res_length,
+            });
         }
 
         let pdu_len = usize::from(res_length - 1);
         if pdu_len < 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "PDU Truncated",
-            ));
+            return Err(ModbusError::PduTruncated { got_len: pdu_len });
         }
 
         let mut res_pdu = [0u8; 253];
@@ -194,34 +191,31 @@ impl ModbusSession {
 
         let res_tid = u16::from_be_bytes([res_mbap[0], res_mbap[1]]);
         if res_tid != req_tid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "response transaction id mismatch from request transaction id",
-            ));
+            return Err(ModbusError::TransactionIdMismatch {
+                expected: req_tid,
+                found: res_tid,
+            });
         }
         let res_pid = u16::from_be_bytes([res_mbap[2], res_mbap[3]]);
         if res_pid != MB_TCP_PID {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid response protocol id",
-            ));
+            return Err(ModbusError::InvalidProtocolId {
+                expected: MB_TCP_PID,
+                found: res_pid,
+            });
         }
 
         let res_uid = res_mbap[6];
         if req_uid != res_uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "response unit id mismatch from request unit id",
-            ));
+            return Err(ModbusError::UnitIdMismatch {
+                expected: req_uid,
+                found: res_uid,
+            });
         }
         if res_fc != req_pdu[0] && res_fc != (req_pdu[0] | 0x80) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Function code mismatch. expected: {}, got: {}",
-                    req_pdu[0], res_fc
-                ),
-            ));
+            return Err(ModbusError::FunctionCodeMismatch {
+                request: req_pdu[0],
+                response: res_fc,
+            });
         }
 
         match res_fc {
@@ -235,15 +229,12 @@ impl ModbusSession {
             }
 
             0x83 | 0x84 => Self::process_exception(&res_pdu[..pdu_len]),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Unknown FC",
-            )),
+            _ => Err(ModbusError::UnexpectedFunctionCode { found: res_fc }),
         }
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), ModbusError> {
     let mut session = ModbusSession::connect("127.0.0.1:10502").expect("good");
     let operation_fc03 =
         ModbusOperation::new(0x01, FunctionCode::ReadHoldingRegisters, 0x0000, 0x0002)
@@ -320,5 +311,73 @@ pub(crate) enum FunctionCode {
     ReadInputRegisters = 0x04,
 }
 
+#[derive(Debug)]
+pub(crate) enum ModbusError {
+    Io(std::io::Error),
+    PduTruncated { got_len: usize },
+    InvalidMbapLength { min: u16, max: u16, found: u16 },
+    TransactionIdMismatch { expected: u16, found: u16 },
+    InvalidProtocolId { expected: u16, found: u16 },
+    UnitIdMismatch { expected: u8, found: u8 },
+    FunctionCodeMismatch { request: u8, response: u8 },
+    UnexpectedFunctionCode { found: u8 },
+    ByteCountMismatched { expected: u16, found: u16 },
+    ActualDataLenMismatchByteCount { byte_count: usize, data_len: usize },
+    InvalidExceptionPduLen { expected: usize, found: usize },
+}
+
+impl From<io::Error> for ModbusError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::fmt::Display for ModbusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActualDataLenMismatchByteCount {
+                byte_count,
+                data_len,
+            } => write!(
+                f,
+                "Actual Response data len and response byte count mismatched: expected {byte_count}, found {data_len}"
+            ),
+            Self::ByteCountMismatched { expected, found } => write!(
+                f,
+                "Response byte count mismatch from request quantity: expected {expected}, found {found}"
+            ),
+            Self::FunctionCodeMismatch { request, response } => write!(
+                f,
+                "Response function code mismatch request function code: expected {request}, found {response}"
+            ),
+            Self::InvalidMbapLength { min, max, found } => write!(
+                f,
+                "Invalid MBAP length: min {min}, max {max}, found {found}"
+            ),
+            Self::InvalidProtocolId { expected, found } => {
+                write!(f, "Invalid protocol ID: expected {expected}, found {found}")
+            }
+            Self::PduTruncated { got_len } => {
+                write!(f, "Response PDU truncated: got_len {got_len}")
+            }
+            Self::TransactionIdMismatch { expected, found } => write!(
+                f,
+                "Response transaction ID mismatch from request transaction ID: expected {expected}, found {found}"
+            ),
+            Self::UnexpectedFunctionCode { found } => {
+                write!(f, "Unexpected function code: found {found}")
+            }
+            Self::UnitIdMismatch { expected, found } => write!(
+                f,
+                "Response unit ID mismatch from request unit ID: expected {expected}, found {found}"
+            ),
+            Self::InvalidExceptionPduLen { expected, found } => write!(
+                f,
+                "Invalid exception PDU len: expected {expected}, found {found}"
+            ),
+            Self::Io(error) => write!(f, "I/O Error: {error}"),
+        }
+    }
+}
 #[cfg(test)]
 mod tests;
