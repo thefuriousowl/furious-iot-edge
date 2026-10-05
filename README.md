@@ -1,7 +1,7 @@
 # furious-iot-edge
 
 `furious-iot-edge` is a Rust-based industrial IoT edge runtime focused on
-predictable ownership, low-allocation hot paths, and protocol correctness.
+protocol correctness, predictable ownership, and low-allocation hot paths.
 
 The first protocol target is Modbus TCP.
 
@@ -11,28 +11,24 @@ The first protocol target is Modbus TCP.
 
 Early development.
 
-The current Modbus TCP prototype supports:
+Current Modbus TCP support includes:
 
 - Persistent TCP sessions
-- Serialized FC03 (holding registers) and FC04 (input registers) transactions
-- Caller-owned operation definitions with typed function codes, borrowed by the session
-- Multiple operations with different Unit IDs, function codes, addresses, and quantities on one connection
-- Modbus TCP MBAP framing
-- Transaction ID correlation
-- Protocol ID, Unit ID, and response function code validation
+- Serialized FC03 and FC04 transactions
+- Caller-owned operation definitions
+- Multiple operations on one connection
+- MBAP framing and response correlation
+- Validation of Transaction ID, Protocol ID, Unit ID, function code, MBAP Length, and Byte Count
 - Fixed-size request and response buffers
-- Register decoding without per-poll heap allocation
-- Returned register data and Modbus exception outcomes
-- Preservation of unrecognized exception codes
-- Typed transaction errors with expected/observed values, preserved underlying I/O errors, and `Display` messages
+- Register decoding without per-transaction heap allocation
+- Register results and Modbus exception outcomes
+- Preservation of unknown exception codes
+- Typed protocol and I/O errors
 
-Eleven scripted TCP tests cover request bytes, decoded register values, multiple
-operations on one connection, valid FC03/FC04 exceptions followed by successful
-transactions, rejection of mismatched Transaction IDs, invalid Protocol IDs,
-mismatched Unit IDs and normal/exception function codes, and Byte Count mismatches
-against the requested register quantity or actual response data byte length.
-They also verify that a connection closed during an incomplete response PDU
-returns an I/O error with `UnexpectedEof`.
+Scripted TCP tests cover normal FC03/FC04 transactions, multiple operations on one
+connection, valid exceptions followed by successful transactions, response mismatch
+handling, malformed exception responses, invalid MBAP Length values, incomplete MBAP
+headers, truncated response PDUs, and Byte Count validation.
 
 Function codes other than FC03/FC04, scheduling, and reconnect behavior are not
 implemented yet.
@@ -43,4 +39,3 @@ implemented yet.
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
-```

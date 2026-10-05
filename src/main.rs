@@ -181,6 +181,10 @@ impl ModbusSession {
 
         let pdu_len = usize::from(res_length - 1);
         if pdu_len < 2 {
+            if pdu_len == 1 {
+                let mut _trash_byte = [0u8; 1];
+                self.stream.read_exact(&mut _trash_byte)?;
+            }
             return Err(ModbusError::PduTruncated { got_len: pdu_len });
         }
 

@@ -1,4 +1,7 @@
-use crate::{MB_TCP_PID, ModbusError, ModbusException, ModbusOperation, ModbusSession};
+use crate::{
+    FunctionCode::ReadHoldingRegisters, MB_TCP_PID, ModbusError, ModbusException, ModbusOperation,
+    ModbusSession,
+};
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -34,6 +37,164 @@ fn serve_exchanges(mut stream: std::net::TcpStream, exchanges: &[([u8; 12], &[u8
     }
 }
 #[test]
+fn reject_incomplete_mbap_header() {
+    let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+        let mut request = [0u8; 12];
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
+
+        // TID: 0, PID: 0, LENGTH: 7, missing unit ID
+        let incomplete_response = [0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
+
+        server_stream
+            .write_all(&incomplete_response)
+            .expect("should write partial response");
+
+        drop(server_stream);
+    });
+
+    let mut session =
+        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 3)
+        .expect("valid fc03 operation");
+    let response = session.execute(&operation);
+    assert!(
+        matches!(response, Err(ModbusError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+    server_thread
+        .join()
+        .expect("server thread panicked or failed");
+}
+#[test]
+fn reject_invalid_mbap_length() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get local test server address");
+
+    let server_thread = thread::spawn(move || {
+        let invalid_mbap_lengths: [u16; 4] = [0, 1, 255, 65535];
+        for i in 0..4 {
+            let (mut server_stream, _) = server.accept().expect("should accept client connection");
+            let mut request_buf = [0u8; 12];
+            server_stream
+                .read_exact(&mut request_buf)
+                .expect("should read request");
+            let expected_request_fc03_adu = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+            ];
+            assert_eq!(expected_request_fc03_adu, request_buf);
+            // TID: 0, PID: 0, LENGTH: invalid_mbap_lengths[i], UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
+            let mut invalid_length_fc03_response = [0u8; 13];
+            invalid_length_fc03_response[0..2].copy_from_slice(&0u16.to_be_bytes());
+            invalid_length_fc03_response[2..4].copy_from_slice(&0u16.to_be_bytes());
+            invalid_length_fc03_response[4..6]
+                .copy_from_slice(&invalid_mbap_lengths[i].to_be_bytes());
+            invalid_length_fc03_response[6] = 0x01;
+            invalid_length_fc03_response[7] = 0x03;
+            invalid_length_fc03_response[8] = 0x04;
+            invalid_length_fc03_response[9..11].copy_from_slice(&10u16.to_be_bytes());
+            invalid_length_fc03_response[11..13].copy_from_slice(&20u16.to_be_bytes());
+
+            server_stream
+                .write_all(&invalid_length_fc03_response)
+                .expect("should write response")
+        }
+    });
+
+    for i in 0..4 {
+        let mut session = ModbusSession::connect(&server_addr.to_string())
+            .expect("should connect to test server");
+        let operation =
+            ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+        let response = session.execute(&operation);
+        match i {
+            0 => assert!(matches!(
+                response,
+                Err(ModbusError::InvalidMbapLength {
+                    min: 2,
+                    max: 254,
+                    found: 0
+                })
+            )),
+            1 => assert!(matches!(
+                response,
+                Err(ModbusError::InvalidMbapLength {
+                    min: 2,
+                    max: 254,
+                    found: 1
+                })
+            )),
+            2 => assert!(matches!(
+                response,
+                Err(ModbusError::InvalidMbapLength {
+                    min: 2,
+                    max: 254,
+                    found: 255
+                })
+            )),
+            3 => assert!(matches!(
+                response,
+                Err(ModbusError::InvalidMbapLength {
+                    min: 2,
+                    max: 254,
+                    found: 65535
+                })
+            )),
+            _ => panic!("panic if i not in range 0..4"),
+        }
+    }
+
+    server_thread.join().expect("server thread failed");
+}
+#[test]
+fn short_pdu_then_valid_fc03_on_same_connection() {
+    let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+        // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
+        let expected_first_request_fc03_adu = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+
+        let truncated_exception_byte_pdu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x83];
+
+        let expected_second_request_fc03_adu = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+
+        // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
+        let valid_fc03_response = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+        ];
+
+        serve_exchanges(
+            server_stream,
+            &[
+                (
+                    expected_first_request_fc03_adu,
+                    &truncated_exception_byte_pdu,
+                ),
+                (expected_second_request_fc03_adu, &valid_fc03_response),
+            ],
+        );
+    });
+
+    let mut session =
+        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
+        .expect("valid FC03 operation");
+    let response = session.execute(&operation);
+    assert!(matches!(
+        response,
+        Err(ModbusError::PduTruncated { got_len: 1 })
+    ));
+    let response = session
+        .execute(&operation)
+        .expect("should get valid response");
+    assert_eq!(response.registers(), Some(&[10u16, 20][..]));
+    server_thread.join().expect("server thread panic or failed");
+}
+#[test]
 fn success_transaction_after_reject_malformed_exception() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
@@ -41,7 +202,7 @@ fn success_transaction_after_reject_malformed_exception() {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
         ];
 
-        let exceeded_exception_byte_pdu =
+        let exceeded_exception_byte_adu =
             [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x83, 0x02, 0x00];
 
         let expected_second_request_fc03_adu = [
@@ -58,7 +219,7 @@ fn success_transaction_after_reject_malformed_exception() {
             &[
                 (
                     expected_first_request_fc03_adu,
-                    &exceeded_exception_byte_pdu,
+                    &exceeded_exception_byte_adu,
                 ),
                 (expected_second_request_fc03_adu, &valid_fc03_response),
             ],
@@ -83,35 +244,7 @@ fn success_transaction_after_reject_malformed_exception() {
     assert_eq!(response.registers(), Some(&[10u16, 20][..]));
     server_thread.join().expect("server thread panic or failed");
 }
-#[test]
-fn reject_exceeded_exception_byte_pdu() {
-    let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
-        let expected_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-        let exceeded_exception_byte_pdu =
-            [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x83, 0x02, 0x00];
-        serve_exchanges(
-            server_stream,
-            &[(expected_request_fc03_adu, &exceeded_exception_byte_pdu)],
-        );
-    });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
-    let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
-        .expect("valid FC03 operation");
-    let response = session.execute(&operation);
-    assert!(matches!(
-        response,
-        Err(ModbusError::InvalidExceptionPduLen {
-            expected: 2,
-            found: 3,
-        })
-    ));
-
-    server_thread.join().expect("server thread panic or failed");
-}
 #[test]
 fn reject_truncated_response_from_unexpected_connection_close() {
     let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
