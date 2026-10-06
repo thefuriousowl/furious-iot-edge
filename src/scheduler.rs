@@ -128,4 +128,8 @@ impl Scheduler {
             }
         }
     }
+
+    pub(crate) fn ops(&self) -> &[ScheduledOp] {
+        &self.ops
+    }
 }

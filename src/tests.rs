@@ -1,11 +1,14 @@
 use crate::{
-    FunctionCode::ReadHoldingRegisters, ModbusError, ModbusOperation, ModbusSession,
+    FunctionCode::ReadHoldingRegisters,
+    ModbusError, ModbusOperation, ModbusSession,
     modbus_tcp::ModbusException,
+    scheduler::{ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
     net::TcpListener,
     thread,
+    time::Duration,
 };
 // In ADU summaries, LENGTH is the MBAP Length field (Unit ID + PDU), in bytes.
 fn create_tcp_test_server(
@@ -35,6 +38,48 @@ fn serve_exchanges(mut stream: std::net::TcpStream, exchanges: &[([u8; 12], &[u8
 
         stream.write_all(response).expect("should write response");
     }
+}
+#[test]
+fn persist_success_operation_snapshot_after_exception_occurred() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get local server address");
+    let server_thread = thread::spawn(move || {
+        let (mut server_stream, _) = server.accept().expect("should accept client connection");
+        let mut request = [0u8; 12];
+
+        server_stream.read_exact(&mut request);
+        let valid_fc03_response = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+        ];
+
+        server_stream.write_all(&valid_fc03_response);
+
+        server_stream.read_exact(&mut request);
+        let exception_response_adu = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
+        server_stream.write_all(&exception_response_adu);
+
+        // valid_fc03_response[1] = 0x02;
+        // server_stream.write_all(&valid_fc03_response);
+    });
+
+    let operation =
+        ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+    let mut session =
+        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let scheduled_operation =
+        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_operation);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(result, Err(ModbusError::Io(_))));
+    let (registers, _) = scheduler.ops()[0]
+        .last_success()
+        .expect("snapshot should still exist after exception");
+    assert_eq!(registers, &[10u16, 20][..]);
+
+    server_thread.join().expect("server panicked or failed");
 }
 #[test]
 fn reject_incomplete_mbap_header() {
@@ -87,19 +132,19 @@ fn reject_invalid_mbap_length() {
             assert_eq!(expected_request_fc03_adu, request_buf);
             // TID: 0, PID: 0, LENGTH: invalid_mbap_lengths[i], UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
             let mut invalid_length_fc03_response = [0u8; 13];
-            invalid_length_fc03_response[0..2].copy_from_slice(&0u16.to_be_bytes());
-            invalid_length_fc03_response[2..4].copy_from_slice(&0u16.to_be_bytes());
+            invalid_length_fc03_response[0..2].copy_from_slice(&(0u16).to_be_bytes());
+            invalid_length_fc03_response[2..4].copy_from_slice(&(0u16).to_be_bytes());
             invalid_length_fc03_response[4..6]
                 .copy_from_slice(&invalid_mbap_lengths[i].to_be_bytes());
             invalid_length_fc03_response[6] = 0x01;
             invalid_length_fc03_response[7] = 0x03;
             invalid_length_fc03_response[8] = 0x04;
-            invalid_length_fc03_response[9..11].copy_from_slice(&10u16.to_be_bytes());
-            invalid_length_fc03_response[11..13].copy_from_slice(&20u16.to_be_bytes());
+            invalid_length_fc03_response[9..11].copy_from_slice(&(10u16).to_be_bytes());
+            invalid_length_fc03_response[11..13].copy_from_slice(&(20u16).to_be_bytes());
 
             server_stream
                 .write_all(&invalid_length_fc03_response)
-                .expect("should write response")
+                .expect("should write response");
         }
     });
 
@@ -115,7 +160,7 @@ fn reject_invalid_mbap_length() {
                 Err(ModbusError::InvalidMbapLength {
                     min: 2,
                     max: 254,
-                    found: 0
+                    found: 0,
                 })
             )),
             1 => assert!(matches!(
@@ -123,7 +168,7 @@ fn reject_invalid_mbap_length() {
                 Err(ModbusError::InvalidMbapLength {
                     min: 2,
                     max: 254,
-                    found: 1
+                    found: 1,
                 })
             )),
             2 => assert!(matches!(
@@ -131,7 +176,7 @@ fn reject_invalid_mbap_length() {
                 Err(ModbusError::InvalidMbapLength {
                     min: 2,
                     max: 254,
-                    found: 255
+                    found: 255,
                 })
             )),
             3 => assert!(matches!(
@@ -139,7 +184,7 @@ fn reject_invalid_mbap_length() {
                 Err(ModbusError::InvalidMbapLength {
                     min: 2,
                     max: 254,
-                    found: 65535
+                    found: 65535,
                 })
             )),
             _ => panic!("panic if i not in range 0..4"),
