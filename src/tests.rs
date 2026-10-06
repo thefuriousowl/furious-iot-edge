@@ -1,6 +1,6 @@
 use crate::{
-    FunctionCode::ReadHoldingRegisters, MB_TCP_PID, ModbusError, ModbusException, ModbusOperation,
-    ModbusSession,
+    FunctionCode::ReadHoldingRegisters, ModbusError, ModbusOperation, ModbusSession,
+    modbus_tcp::ModbusException,
 };
 use std::{
     io::{Read, Write},
@@ -339,7 +339,7 @@ fn reject_mismatch_protocol_id() {
     assert!(matches!(
         response,
         Err(ModbusError::InvalidProtocolId {
-            expected: MB_TCP_PID,
+            expected: 0x0000,
             found: 0x0001,
         })
     ));
