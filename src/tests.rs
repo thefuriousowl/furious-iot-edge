@@ -2,7 +2,7 @@ use crate::{
     FunctionCode::ReadHoldingRegisters,
     ModbusError, ModbusOperation, ModbusSession,
     modbus_tcp::ModbusException,
-    scheduler::{self, ScheduledOp, Scheduler},
+    scheduler::{ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
@@ -46,6 +46,57 @@ fn create_tcp_test_client(server_addr: SocketAddr) -> ModbusSession {
     ModbusSession::connect(&server_addr.to_string(), GLOBAL_TEST_READ_TIMEOUT)
         .expect("should connect to test server")
 }
+#[test]
+fn invalid_response_on_usable_connection_keeps_polling() {
+    let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+        let expected_first_request = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let first_valid_fc03_response = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+        ];
+
+        let expected_second_request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let invalid_byte_count_fc03_response = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x03, 0x00, 0x0a, 0x00, 0x14,
+        ];
+
+        let expected_third_request = [
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let second_valid_fc03_response = [
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x1e, 0x00, 0x28,
+        ];
+
+        serve_exchanges(
+            server_stream,
+            &[
+                (expected_first_request, &first_valid_fc03_response),
+                (expected_second_request, &invalid_byte_count_fc03_response),
+                (expected_third_request, &second_valid_fc03_response),
+            ],
+        )
+    });
+    let operation =
+        ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+    let mut session = create_tcp_test_client(server_addr);
+    let scheduled_operation =
+        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_operation);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(result, Err(ModbusError::Io(_))));
+    let (registers, _) = scheduler.ops()[0]
+        .last_success()
+        .expect("snapshot should still exist after invalid response");
+
+    assert_eq!(registers, &[30u16, 40][..]);
+
+    server_thread.join().expect("server panicked or failed");
+}
+
 #[test]
 fn silent_server_returns_read_timeout_error() {
     let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
@@ -99,9 +150,6 @@ fn persist_success_operation_snapshot_after_exception_occurred() {
         server_stream
             .write_all(&exception_response_adu)
             .expect("should write response");
-
-        // valid_fc03_response[1] = 0x02;
-        // server_stream.write_all(&valid_fc03_response);
     });
 
     let operation =
