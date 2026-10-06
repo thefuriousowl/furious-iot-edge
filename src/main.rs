@@ -48,7 +48,7 @@ fn main() -> Result<(), ModbusError> {
     scheduler.add_operation(scheduled_exception_operation);
     loop {
         match scheduler.run_all(&mut session) {
-            Err(ModbusError::Io(error)) => {
+            Err(error) => {
                 eprintln!("Connection error: {error}");
 
                 loop {
@@ -65,7 +65,6 @@ fn main() -> Result<(), ModbusError> {
                     }
                 }
             }
-            Err(error) => return Err(error),
             Ok(_) => return Ok(()),
         }
     }

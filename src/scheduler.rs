@@ -106,10 +106,10 @@ impl Scheduler {
             for op in &mut self.ops {
                 if op.is_due() {
                     println!("Previous: {:?}", op.last_success());
-                    let response = session.execute(&op.operation)?;
+                    let result = session.execute(&op.operation);
                     let now = Instant::now();
-                    match response {
-                        ModbusResponse::Registers { data, count } => {
+                    match result {
+                        Ok(ModbusResponse::Registers { data, count }) => {
                             op.store_registers_snapshot(data, count, now);
 
                             println!(
@@ -118,9 +118,14 @@ impl Scheduler {
                                 op.last_success()
                             )
                         }
-                        ModbusResponse::Exception(..) => {
-                            println!("T: {:?}, exception: {:?}", now, response.exception())
+                        Ok(ModbusResponse::Exception(exception)) => {
+                            println!("T: {:?}, exception: {:?}", now, exception)
                         }
+                        Err(error) if error.connection_still_usable() => {
+                            eprintln!("Connection error: {error}");
+                        }
+
+                        Err(error) => return Err(error),
                     }
 
                     op.set_next_due(now);

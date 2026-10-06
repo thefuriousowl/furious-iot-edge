@@ -304,6 +304,24 @@ pub(crate) enum ModbusError {
     InvalidExceptionPduLen { expected: usize, found: usize },
 }
 
+impl ModbusError {
+    pub(crate) fn connection_still_usable(&self) -> bool {
+        match self {
+            Self::PduTruncated { .. }
+            | Self::InvalidExceptionPduLen { .. }
+            | Self::ByteCountMismatched { .. }
+            | Self::FunctionCodeMismatch { .. } => true,
+            Self::Io(..)
+            | Self::InvalidMbapLength { .. }
+            | Self::TransactionIdMismatch { .. }
+            | Self::InvalidProtocolId { .. }
+            | Self::UnitIdMismatch { .. }
+            | Self::UnexpectedFunctionCode { .. }
+            | Self::ActualDataLenMismatchByteCount { .. } => false,
+        }
+    }
+}
+
 impl From<io::Error> for ModbusError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
