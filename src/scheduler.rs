@@ -7,10 +7,28 @@ use crate::modbus_tcp::{ModbusError, ModbusOperation, ModbusResponse, ModbusSess
 
 const MIN_ALLOW_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Debug)]
+pub(crate) struct RegisterSnapshot {
+    data: [u16; 125],
+    count: usize,
+    acquired_at: Instant,
+}
+
+impl RegisterSnapshot {
+    pub(crate) fn from(data: [u16; 125], count: usize, acquired_at: Instant) -> Self {
+        Self {
+            data,
+            count,
+            acquired_at,
+        }
+    }
+}
+
 pub(crate) struct ScheduledOp {
     operation: ModbusOperation,
     interval: Duration,
     next_due: Instant,
+    last_success: Option<RegisterSnapshot>,
 }
 impl ScheduledOp {
     pub(crate) fn new(operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
@@ -21,6 +39,7 @@ impl ScheduledOp {
             operation,
             interval,
             next_due: Instant::now(),
+            last_success: None,
         })
     }
 
@@ -35,6 +54,22 @@ impl ScheduledOp {
 
         while self.next_due <= now {
             self.next_due += self.interval
+        }
+    }
+
+    pub(crate) fn store_registers_snapshot(
+        &mut self,
+        data: [u16; 125],
+        count: usize,
+        now: Instant,
+    ) {
+        self.last_success = Some(RegisterSnapshot::from(data, count, now))
+    }
+
+    pub(crate) fn last_success(&self) -> Option<(&[u16], Instant)> {
+        match &self.last_success {
+            None => None,
+            Some(snapshot) => Some((&snapshot.data[..snapshot.count], snapshot.acquired_at)),
         }
     }
 }
@@ -70,11 +105,18 @@ impl Scheduler {
 
             for op in &mut self.ops {
                 if op.is_due() {
+                    println!("Previous: {:?}", op.last_success());
                     let response = session.execute(&op.operation)?;
                     let now = Instant::now();
                     match response {
-                        ModbusResponse::Registers { .. } => {
-                            println!("T: {:?}, registers: {:?}", now, response.registers())
+                        ModbusResponse::Registers { data, count } => {
+                            op.store_registers_snapshot(data, count, now);
+
+                            println!(
+                                "Last Success: {:?}, registers: {:?}",
+                                now,
+                                op.last_success()
+                            )
                         }
                         ModbusResponse::Exception(..) => {
                             println!("T: {:?}, exception: {:?}", now, response.exception())
