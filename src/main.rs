@@ -2,12 +2,12 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MB_TCP_PID: u16 = 0;
 const MBAP_HEADER_LEN: usize = 7;
-
+const MIN_ALLOW_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct ModbusOperation {
     unit_id: u8,
     function_code: FunctionCode,
@@ -238,32 +238,134 @@ impl ModbusSession {
     }
 }
 
+pub(crate) struct ScheduledOp {
+    operation: ModbusOperation,
+    interval: Duration,
+    next_due: Instant,
+}
+impl ScheduledOp {
+    pub(crate) fn new(operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
+        if interval < MIN_ALLOW_INTERVAL {
+            return Err(format!("interval must be at least {MIN_ALLOW_INTERVAL:?}"));
+        }
+        Ok(Self {
+            operation,
+            interval,
+            next_due: Instant::now(),
+        })
+    }
+
+    pub(crate) fn is_due(&self) -> bool {
+        Instant::now() >= self.next_due
+    }
+    pub(crate) fn time_until_due(&self) -> Duration {
+        self.next_due.saturating_duration_since(Instant::now())
+    }
+    pub(crate) fn set_next_due(&mut self, now: Instant) {
+        self.next_due += self.interval;
+
+        while self.next_due <= now {
+            self.next_due += self.interval
+        }
+    }
+}
+
+pub(crate) struct Scheduler {
+    ops: Vec<ScheduledOp>,
+}
+
+impl Scheduler {
+    pub(crate) fn new() -> Self {
+        Self { ops: vec![] }
+    }
+
+    pub(crate) fn add_operation(&mut self, scheduled_op: ScheduledOp) {
+        self.ops.push(scheduled_op);
+    }
+
+    pub(crate) fn run_all(
+        &mut self,
+        session: &mut ModbusSession,
+    ) -> Result<ModbusResponse, ModbusError> {
+        loop {
+            let min_wait = self
+                .ops
+                .iter()
+                .map(|op| op.time_until_due())
+                .min()
+                .unwrap_or(Duration::ZERO);
+
+            if !min_wait.is_zero() {
+                sleep(min_wait);
+            }
+
+            for op in &mut self.ops {
+                if op.is_due() {
+                    let response = session.execute(&op.operation)?;
+                    let now = Instant::now();
+                    match response {
+                        ModbusResponse::Registers { .. } => {
+                            println!("T: {:?}, registers: {:?}", now, response.registers())
+                        }
+                        ModbusResponse::Exception(..) => {
+                            println!("T: {:?}, exception: {:?}", now, response.exception())
+                        }
+                    }
+
+                    op.set_next_due(now);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), ModbusError> {
-    let mut session = ModbusSession::connect("127.0.0.1:10502").expect("good");
+    let mut session = ModbusSession::connect("127.0.0.1:10502")?;
     let operation_fc03 =
         ModbusOperation::new(0x01, FunctionCode::ReadHoldingRegisters, 0x0000, 0x0002)
             .expect("should be valid");
     let operation_fc04 =
         ModbusOperation::new(0x02, FunctionCode::ReadInputRegisters, 0x0000, 0x0002)
             .expect("should be valid");
+
+    let another_fc04_operation =
+        ModbusOperation::new(0x02, FunctionCode::ReadInputRegisters, 0x0000, 0x0010)
+            .expect("should be valid");
+
+    let scheduled_operation_fc03 =
+        ScheduledOp::new(operation_fc03, Duration::from_millis(1000)).expect("valid scheduled_op");
+    let scheduled_operation_fc04 =
+        ScheduledOp::new(operation_fc04, Duration::from_millis(5000)).expect("valid scheduled_op");
+    let scheduled_another_fc04_operation =
+        ScheduledOp::new(another_fc04_operation, Duration::from_millis(3000))
+            .expect("valid scheduled_op");
+
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_operation_fc03);
+    scheduler.add_operation(scheduled_operation_fc04);
+    scheduler.add_operation(scheduled_another_fc04_operation);
     loop {
-        let response_fc03 = session.execute(&operation_fc03)?;
+        match scheduler.run_all(&mut session) {
+            Err(ModbusError::Io(error)) => {
+                eprintln!("Connection error: {error}");
 
-        if let Some(registers_fc03) = response_fc03.registers() {
-            println!("Registers FC03: {registers_fc03:?}");
-        } else if let Some(exception_fc03) = response_fc03.exception() {
-            println!("Modbus exception: {exception_fc03:?}");
+                loop {
+                    sleep(Duration::from_secs(1));
+
+                    match ModbusSession::connect("127.0.0.1:10502") {
+                        Ok(new_session) => {
+                            session = new_session;
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("Reconnect failed: {error}");
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+            Ok(_) => return Ok(()),
         }
-
-        let response_fc04 = session.execute(&operation_fc04)?;
-
-        if let Some(registers_fc04) = response_fc04.registers() {
-            println!("Registers FC04: {registers_fc04:?}");
-        } else if let Some(exception_fc04) = response_fc04.exception() {
-            println!("Modbus exception: {exception_fc04:?}");
-        }
-
-        sleep(Duration::from_secs(1));
     }
 }
 
