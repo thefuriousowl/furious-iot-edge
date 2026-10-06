@@ -2,14 +2,16 @@ use crate::{
     FunctionCode::ReadHoldingRegisters,
     ModbusError, ModbusOperation, ModbusSession,
     modbus_tcp::ModbusException,
-    scheduler::{ScheduledOp, Scheduler},
+    scheduler::{self, ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     thread,
     time::Duration,
 };
+
+const GLOBAL_TEST_READ_TIMEOUT: Duration = Duration::from_millis(200);
 // In ADU summaries, LENGTH is the MBAP Length field (Unit ID + PDU), in bytes.
 fn create_tcp_test_server(
     server_fn: impl FnOnce(std::net::TcpStream) + Send + 'static,
@@ -39,6 +41,36 @@ fn serve_exchanges(mut stream: std::net::TcpStream, exchanges: &[([u8; 12], &[u8
         stream.write_all(response).expect("should write response");
     }
 }
+
+fn create_tcp_test_client(server_addr: SocketAddr) -> ModbusSession {
+    ModbusSession::connect(&server_addr.to_string(), GLOBAL_TEST_READ_TIMEOUT)
+        .expect("should connect to test server")
+}
+#[test]
+fn silent_server_returns_read_timeout_error() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get test server local address");
+    let server_thread = thread::spawn(move || {
+        let (mut server_stream, _) = server.accept().expect("should accept client connection");
+        let mut request = [0u8; 12];
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
+
+        thread::sleep(GLOBAL_TEST_READ_TIMEOUT * 2);
+    });
+
+    let mut session = create_tcp_test_client(server_addr);
+    let response = session
+        .execute(&ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid request"));
+
+    assert!(
+        matches!(response, Err(ModbusError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut)
+    );
+    server_thread.join().expect("server panicked or failed");
+}
 #[test]
 fn persist_success_operation_snapshot_after_exception_occurred() {
     let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
@@ -49,16 +81,24 @@ fn persist_success_operation_snapshot_after_exception_occurred() {
         let (mut server_stream, _) = server.accept().expect("should accept client connection");
         let mut request = [0u8; 12];
 
-        server_stream.read_exact(&mut request);
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
         let valid_fc03_response = [
             0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
         ];
 
-        server_stream.write_all(&valid_fc03_response);
+        server_stream
+            .write_all(&valid_fc03_response)
+            .expect("should write response");
 
-        server_stream.read_exact(&mut request);
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
         let exception_response_adu = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
-        server_stream.write_all(&exception_response_adu);
+        server_stream
+            .write_all(&exception_response_adu)
+            .expect("should write response");
 
         // valid_fc03_response[1] = 0x02;
         // server_stream.write_all(&valid_fc03_response);
@@ -66,8 +106,7 @@ fn persist_success_operation_snapshot_after_exception_occurred() {
 
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let scheduled_operation =
         ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
     let mut scheduler = Scheduler::new();
@@ -99,8 +138,7 @@ fn reject_incomplete_mbap_header() {
         drop(server_stream);
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 3)
         .expect("valid fc03 operation");
     let response = session.execute(&operation);
@@ -149,8 +187,7 @@ fn reject_invalid_mbap_length() {
     });
 
     for i in 0..4 {
-        let mut session = ModbusSession::connect(&server_addr.to_string())
-            .expect("should connect to test server");
+        let mut session = create_tcp_test_client(server_addr);
         let operation =
             ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
         let response = session.execute(&operation);
@@ -224,8 +261,7 @@ fn short_pdu_then_valid_fc03_on_same_connection() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
@@ -271,8 +307,7 @@ fn success_transaction_after_reject_malformed_exception() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
@@ -311,8 +346,7 @@ fn reject_truncated_response_from_unexpected_connection_close() {
         drop(server_stream);
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 3)
         .expect("valid fc03 operation");
     let response = session.execute(&operation);
@@ -342,8 +376,7 @@ fn reject_mismatch_unit_id() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
@@ -375,8 +408,7 @@ fn reject_mismatch_protocol_id() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
@@ -408,8 +440,7 @@ fn reject_mismatch_transaction_id() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid FC03 operation");
     let response = session.execute(&operation);
@@ -460,8 +491,7 @@ fn reject_byte_count_mismatch_quantity() {
             ],
         );
     });
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadHoldingRegisters, 0, 2)
         .expect("valid fc03 request");
     let response = session.execute(&operation_a);
@@ -543,8 +573,7 @@ fn reject_mismatch_fc() {
 
     let operation_a = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 0, 2)
         .expect("should be valid fc04 operation");
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should successfully connect");
+    let mut session = create_tcp_test_client(server_addr);
     let response = session.execute(&operation_a);
     assert!(matches!(
         response,
@@ -622,8 +651,7 @@ fn exception_then_valid_fc04_on_same_connection() {
 
     let fc04_operation = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 16, 2)
         .expect("should be valid response");
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("should connect to test server");
+    let mut session = create_tcp_test_client(server_addr);
     let response = session
         .execute(&fc04_operation)
         .expect("should get exception");
@@ -678,8 +706,7 @@ fn different_fc_operations_on_same_connection() {
     let fc04_operation = ModbusOperation::new(2, crate::FunctionCode::ReadInputRegisters, 0, 2)
         .expect("valid operation");
 
-    let mut session = ModbusSession::connect(&server_addr.to_string())
-        .expect("should successfully connect to server");
+    let mut session = create_tcp_test_client(server_addr);
     let fc03_registers = session
         .execute(&fc03_operation)
         .expect("valid fc03 registers");
@@ -712,8 +739,7 @@ fn valid_fc03_round_trip() {
         serve_exchanges(server_stream, &[(expected_request_adu, &response_adu)]);
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(
         0x01,
         crate::FunctionCode::ReadHoldingRegisters,
@@ -757,8 +783,7 @@ fn exception_then_valid_fc03_on_same_connection() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
+    let mut session = create_tcp_test_client(server_addr);
     let operation = ModbusOperation::new(
         0x01,
         crate::FunctionCode::ReadHoldingRegisters,
@@ -815,8 +840,7 @@ fn different_fc03_operations_on_same_connection() {
         );
     });
 
-    let mut session =
-        ModbusSession::connect(&server_addr.to_string()).expect("client should connect");
+    let mut session = create_tcp_test_client(server_addr);
     let operation_a = ModbusOperation::new(
         0x01,
         crate::FunctionCode::ReadHoldingRegisters,

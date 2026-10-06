@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
+    time::Duration,
 };
 
 const MB_TCP_PID: u16 = 0;
@@ -61,11 +62,15 @@ pub(crate) struct ModbusSession {
 }
 
 impl ModbusSession {
-    pub(crate) fn connect(socket_address: &str) -> Result<Self, std::io::Error> {
+    pub(crate) fn connect(
+        socket_address: &str,
+        read_timeout: Duration,
+    ) -> Result<Self, std::io::Error> {
         let parsed_address = socket_address
             .parse::<SocketAddr>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let stream = TcpStream::connect(parsed_address)?;
+        stream.set_read_timeout(Some(read_timeout))?;
         Ok(Self {
             stream,
             next_transaction_id: 0,
