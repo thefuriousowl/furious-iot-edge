@@ -1,14 +1,11 @@
 use crate::{
-    FunctionCode::ReadHoldingRegisters,
-    ModbusError, ModbusOperation, ModbusSession,
-    modbus_tcp::ModbusException,
-    scheduler::{ScheduledOp, Scheduler},
+    FunctionCode::ReadHoldingRegisters, ModbusError, ModbusOperation, ModbusSession, modbus_tcp::{FunctionCode::ReadInputRegisters, ModbusException}, scheduler::{self, ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const GLOBAL_TEST_READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -698,7 +695,7 @@ fn exception_then_valid_fc04_on_same_connection() {
     });
 
     let fc04_operation = ModbusOperation::new(1, crate::FunctionCode::ReadInputRegisters, 16, 2)
-        .expect("should be valid response");
+        .expect("should be valid operation");
     let mut session = create_tcp_test_client(server_addr);
     let response = session
         .execute(&fc04_operation)
@@ -915,4 +912,176 @@ fn different_fc03_operations_on_same_connection() {
     server_thread
         .join()
         .expect("server thread panicked or failed");
+}
+#[test]
+fn transaction_id_mismatch_keeps_seeded_snapshot() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get local server address");
+    let server_thread = thread::spawn(move || {
+        let (mut server_stream, _) = server.accept().expect("should accept client connection");
+        let mut request = [0u8; 12];
+
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
+
+        let invalid_fc03_response = [
+            0x00, 0x05, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x1e, 0x00, 0x28,
+        ];
+        server_stream
+            .write_all(&invalid_fc03_response)
+            .expect("should write response");
+    });
+
+    let operation =
+        ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+    let mut session = create_tcp_test_client(server_addr);
+    let mut scheduled_operation =
+        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+
+    let mut scheduler = Scheduler::new();
+
+    let mut data = [0u16; 125];
+    data[0] = 10;
+    data[1] = 20;
+    let seeded_at = Instant::now();
+    scheduled_operation.store_registers_snapshot(data, 2, seeded_at);
+
+    scheduler.add_operation(scheduled_operation);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(
+        result,
+        Err(ModbusError::TransactionIdMismatch { .. })
+    ));
+    let (registers, acquired_at) = scheduler.ops()[0]
+        .last_success()
+        .expect("seeded snapshot should remain");
+    assert_eq!(registers, &[10u16, 20][..]);
+    assert_eq!(acquired_at, seeded_at);
+
+    server_thread.join().expect("server panicked or failed");
+}
+#[test]
+fn last_success_stays_none_after_first_poll_exception() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get local server address");
+    let server_thread = thread::spawn(move || {
+        let (mut server_stream, _) = server.accept().expect("should accept client connection");
+        let mut request = [0u8; 12];
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
+
+        let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
+        server_stream
+            .write_all(&exception_response_adu)
+            .expect("should write exception response");
+    });
+
+    let operation =
+        ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+    let mut session = create_tcp_test_client(server_addr);
+    let scheduled_operation =
+        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_operation);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(result, Err(ModbusError::Io(_))));
+    assert!(scheduler.ops()[0].last_success().is_none());
+
+    server_thread.join().expect("server panicked or failed");
+}
+
+#[test]
+fn last_success_stays_none_after_first_poll_transaction_id_mismatch() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
+    let server_addr = server
+        .local_addr()
+        .expect("should get local server address");
+    let server_thread = thread::spawn(move || {
+        let (mut server_stream, _) = server.accept().expect("should accept client connection");
+        let mut request = [0u8; 12];
+        server_stream
+            .read_exact(&mut request)
+            .expect("should read request");
+
+        // wrong TID (5), carries [30, 40]
+        let invalid_response_adu = [
+            0x00, 0x05, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x1e, 0x00, 0x28,
+        ];
+        server_stream
+            .write_all(&invalid_response_adu)
+            .expect("should write invalid response");
+    });
+
+    let operation =
+        ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
+    let mut session = create_tcp_test_client(server_addr);
+    let scheduled_operation =
+        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_operation);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(
+        result,
+        Err(ModbusError::TransactionIdMismatch { .. })
+    ));
+    assert!(scheduler.ops()[0].last_success().is_none());
+
+    server_thread.join().expect("server panicked or failed");
+}
+
+#[test]
+fn update_collect_operation() {
+    let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+        let expected_request_op_a = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
+        ];
+
+        let valid_response_op_a = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
+        ];
+
+        let expected_request_op_b = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00, 0x01,
+        ];
+
+        let valid_response_op_b = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x04, 0x02, 0x00, 0x1e,
+        ];
+
+        serve_exchanges(server_stream, &[
+            (expected_request_op_a, &valid_response_op_a),
+            (expected_request_op_b, &valid_response_op_b)
+        ]);
+    });
+
+    let operation_a = ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid operation");
+    let scheduled_op_a = ScheduledOp::new(operation_a, Duration::from_millis(1000)).expect("valid scheduled op");
+    let operation_b = ModbusOperation::new(2, ReadInputRegisters, 0, 1).expect("valid operation");
+    let scheduled_op_b = ScheduledOp::new(operation_b, Duration::from_millis(1000)).expect("valid scheduled op");
+    let mut scheduler = Scheduler::new();
+    scheduler.add_operation(scheduled_op_a);
+    scheduler.add_operation(scheduled_op_b);
+    let mut session = create_tcp_test_client(server_addr);
+    let result = scheduler.run_all(&mut session);
+    assert!(matches!(result, Err(ModbusError::Io(..))));
+    let (registers, _) = scheduler.ops()[0]
+        .last_success()
+        .expect("registers snapshot should match op a");
+    assert_eq!(registers, &[10u16, 20][..]);
+    let (registers, _) = scheduler.ops()[1]
+        .last_success()
+        .expect("registers snapshot should match op b");
+    assert_eq!(registers, &[30u16][..]);
+    server_thread
+        .join()
+        .expect("server thread panicked or failed");
+
 }
