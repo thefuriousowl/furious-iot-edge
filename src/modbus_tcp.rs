@@ -70,6 +70,7 @@ impl ModbusSession {
             .parse::<SocketAddr>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let stream = TcpStream::connect(parsed_address)?;
+
         stream.set_read_timeout(Some(read_timeout))?;
         Ok(Self {
             stream,

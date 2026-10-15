@@ -50,22 +50,22 @@ fn main() -> Result<(), ModbusError> {
         match scheduler.run_all(&mut session) {
             Err(error) => {
                 eprintln!("Connection error: {error}");
-
-                loop {
-                    sleep(Duration::from_secs(1));
-
-                    match ModbusSession::connect("127.0.0.1:10502", TEMP_READ_TIMEOUT) {
-                        Ok(new_session) => {
-                            session = new_session;
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!("Reconnect failed: {error}");
-                        }
-                    }
-                }
+                session = connect_with_retry("127.0.0.1:10502", TEMP_READ_TIMEOUT);
             }
             Ok(_) => return Ok(()),
+        }
+    }
+}
+
+fn connect_with_retry(address: &str, read_timeout: Duration) -> ModbusSession {
+    loop {
+        sleep(Duration::from_secs(1));
+
+        match ModbusSession::connect(address, read_timeout) {
+            Ok(new_session) => return new_session,
+            Err(error) => {
+                eprintln!("Reconnect failed: {error}");
+            }
         }
     }
 }
