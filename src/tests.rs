@@ -2,7 +2,7 @@ use crate::{
     FunctionCode::ReadHoldingRegisters,
     ModbusError, ModbusOperation, ModbusSession,
     modbus_tcp::{FunctionCode::ReadInputRegisters, ModbusException},
-    scheduler::{self, ScheduledOp, Scheduler},
+    scheduler::{ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
