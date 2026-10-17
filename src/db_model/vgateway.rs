@@ -3,11 +3,11 @@ use serde_json::Value;
 
 #[derive(Debug)]
 pub struct VGatewayRow {
-    id: String,
-    name: String,
-    driver: String,
-    config: Value,
-    enabled: bool,
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    pub config: Value,
+    pub enabled: bool,
 }
 impl VGatewayRow {
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
