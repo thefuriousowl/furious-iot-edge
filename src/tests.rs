@@ -1,5 +1,8 @@
 use crate::{
-    FunctionCode::ReadHoldingRegisters, ModbusError, ModbusOperation, ModbusSession, modbus_tcp::{FunctionCode::ReadInputRegisters, ModbusException}, scheduler::{self, ScheduledOp, Scheduler},
+    FunctionCode::ReadHoldingRegisters,
+    ModbusError, ModbusOperation, ModbusSession,
+    modbus_tcp::{FunctionCode::ReadInputRegisters, ModbusException},
+    scheduler::{self, ScheduledOp, Scheduler},
 };
 use std::{
     io::{Read, Write},
@@ -1056,16 +1059,21 @@ fn update_collect_operation() {
             0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x04, 0x02, 0x00, 0x1e,
         ];
 
-        serve_exchanges(server_stream, &[
-            (expected_request_op_a, &valid_response_op_a),
-            (expected_request_op_b, &valid_response_op_b)
-        ]);
+        serve_exchanges(
+            server_stream,
+            &[
+                (expected_request_op_a, &valid_response_op_a),
+                (expected_request_op_b, &valid_response_op_b),
+            ],
+        );
     });
 
     let operation_a = ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid operation");
-    let scheduled_op_a = ScheduledOp::new(operation_a, Duration::from_millis(1000)).expect("valid scheduled op");
+    let scheduled_op_a =
+        ScheduledOp::new(operation_a, Duration::from_millis(1000)).expect("valid scheduled op");
     let operation_b = ModbusOperation::new(2, ReadInputRegisters, 0, 1).expect("valid operation");
-    let scheduled_op_b = ScheduledOp::new(operation_b, Duration::from_millis(1000)).expect("valid scheduled op");
+    let scheduled_op_b =
+        ScheduledOp::new(operation_b, Duration::from_millis(1000)).expect("valid scheduled op");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_op_a);
     scheduler.add_operation(scheduled_op_b);
@@ -1083,5 +1091,4 @@ fn update_collect_operation() {
     server_thread
         .join()
         .expect("server thread panicked or failed");
-
 }
