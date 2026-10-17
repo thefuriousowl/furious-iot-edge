@@ -24,14 +24,14 @@ impl RegisterSnapshot {
     }
 }
 
-pub(crate) struct ScheduledOp {
+pub struct ScheduledOp {
     operation: ModbusOperation,
     interval: Duration,
     next_due: Instant,
     last_success: Option<RegisterSnapshot>,
 }
 impl ScheduledOp {
-    pub(crate) fn new(operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
+    pub fn new(operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
         if interval < MIN_ALLOW_INTERVAL {
             return Err(format!("interval must be at least {MIN_ALLOW_INTERVAL:?}"));
         }
@@ -74,23 +74,20 @@ impl ScheduledOp {
     }
 }
 
-pub(crate) struct Scheduler {
+pub struct Scheduler {
     ops: Vec<ScheduledOp>,
 }
 
 impl Scheduler {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { ops: vec![] }
     }
 
-    pub(crate) fn add_operation(&mut self, scheduled_op: ScheduledOp) {
+    pub fn add_operation(&mut self, scheduled_op: ScheduledOp) {
         self.ops.push(scheduled_op);
     }
 
-    pub(crate) fn run_all(
-        &mut self,
-        session: &mut ModbusSession,
-    ) -> Result<ModbusResponse, ModbusError> {
+    pub fn run_all(&mut self, session: &mut ModbusSession) -> Result<ModbusResponse, ModbusError> {
         loop {
             let min_wait = self
                 .ops

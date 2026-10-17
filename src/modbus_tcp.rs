@@ -7,7 +7,7 @@ use std::{
 const MB_TCP_PID: u16 = 0;
 const MBAP_HEADER_LEN: usize = 7;
 
-pub(crate) struct ModbusOperation {
+pub struct ModbusOperation {
     unit_id: u8,
     function_code: FunctionCode,
     starting_address: u16,
@@ -15,7 +15,7 @@ pub(crate) struct ModbusOperation {
 }
 
 impl ModbusOperation {
-    pub(crate) fn new(
+    pub fn new(
         unit_id: u8,
         function_code: FunctionCode,
         starting_address: u16,
@@ -56,16 +56,13 @@ impl ModbusOperation {
 }
 
 #[derive(Debug)]
-pub(crate) struct ModbusSession {
+pub struct ModbusSession {
     stream: TcpStream,
     next_transaction_id: u16,
 }
 
 impl ModbusSession {
-    pub(crate) fn connect(
-        socket_address: &str,
-        read_timeout: Duration,
-    ) -> Result<Self, std::io::Error> {
+    pub fn connect(socket_address: &str, read_timeout: Duration) -> Result<Self, std::io::Error> {
         let parsed_address = socket_address
             .parse::<SocketAddr>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -244,7 +241,7 @@ impl ModbusSession {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum ModbusException {
+pub enum ModbusException {
     IllegalFunction = 0x01,
     IllegalDataAddress = 0x02,
     IllegalDataValue = 0x03,
@@ -261,7 +258,7 @@ pub(crate) enum ModbusException {
     clippy::large_enum_variant,
     reason = "Fixed register storage avoids per-transaction heap allocation"
 )]
-pub(crate) enum ModbusResponse {
+pub enum ModbusResponse {
     // Bits { data: [u8; 250], count: usize },
     Registers { data: [u16; 125], count: usize },
     Exception(ModbusException),
@@ -285,13 +282,13 @@ impl ModbusResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum FunctionCode {
+pub enum FunctionCode {
     ReadHoldingRegisters = 0x03,
     ReadInputRegisters = 0x04,
 }
 
 #[derive(Debug)]
-pub(crate) enum ModbusError {
+pub enum ModbusError {
     Io(std::io::Error),
     PduTruncated { got_len: usize },
     InvalidMbapLength { min: u16, max: u16, found: u16 },

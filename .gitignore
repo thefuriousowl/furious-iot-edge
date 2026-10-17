@@ -34,4 +34,4 @@ rustc-ice-*.txt
 
 # User defined
 local-data/*.db
-examples/
+examples/scratch_*.rs
