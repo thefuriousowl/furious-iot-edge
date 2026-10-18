@@ -7,6 +7,7 @@ use std::{
 const MB_TCP_PID: u16 = 0;
 const MBAP_HEADER_LEN: usize = 7;
 
+#[derive(Debug)]
 pub struct ModbusOperation {
     unit_id: u8,
     function_code: FunctionCode,
@@ -265,14 +266,14 @@ pub enum ModbusResponse {
 }
 
 impl ModbusResponse {
-    pub(crate) fn registers(&self) -> Option<&[u16]> {
+    pub fn registers(&self) -> Option<&[u16]> {
         match self {
             Self::Registers { data, count } => Some(&data[..*count]),
             Self::Exception(_) => None,
         }
     }
 
-    pub(crate) fn exception(&self) -> Option<ModbusException> {
+    pub fn exception(&self) -> Option<ModbusException> {
         match self {
             Self::Exception(exception) => Some(*exception),
             Self::Registers { .. } => None,

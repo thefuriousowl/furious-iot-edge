@@ -23,7 +23,7 @@ impl RegisterSnapshot {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct ScheduledOp {
     operation: ModbusOperation,
     interval: Duration,
@@ -74,6 +74,7 @@ impl ScheduledOp {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct Scheduler {
     ops: Vec<ScheduledOp>,
 }
@@ -131,7 +132,7 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn ops(&self) -> &[ScheduledOp] {
+    pub fn ops(&self) -> &[ScheduledOp] {
         &self.ops
     }
 }
