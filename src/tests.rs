@@ -207,7 +207,7 @@ fn reject_invalid_mbap_length() {
 
     let server_thread = thread::spawn(move || {
         let invalid_mbap_lengths: [u16; 4] = [0, 1, 255, 65535];
-        for i in 0..4 {
+        for item in invalid_mbap_lengths {
             let (mut server_stream, _) = server.accept().expect("should accept client connection");
             let mut request_buf = [0u8; 12];
             server_stream
@@ -221,8 +221,7 @@ fn reject_invalid_mbap_length() {
             let mut invalid_length_fc03_response = [0u8; 13];
             invalid_length_fc03_response[0..2].copy_from_slice(&(0u16).to_be_bytes());
             invalid_length_fc03_response[2..4].copy_from_slice(&(0u16).to_be_bytes());
-            invalid_length_fc03_response[4..6]
-                .copy_from_slice(&invalid_mbap_lengths[i].to_be_bytes());
+            invalid_length_fc03_response[4..6].copy_from_slice(&item.to_be_bytes());
             invalid_length_fc03_response[6] = 0x01;
             invalid_length_fc03_response[7] = 0x03;
             invalid_length_fc03_response[8] = 0x04;
