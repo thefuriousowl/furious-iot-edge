@@ -5,7 +5,7 @@ use std::{
 
 use crate::modbus_tcp::{ModbusError, ModbusOperation, ModbusResponse, ModbusSession};
 
-const MIN_ALLOW_INTERVAL: Duration = Duration::from_millis(100);
+pub const MIN_ALLOW_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(crate) struct RegisterSnapshot {

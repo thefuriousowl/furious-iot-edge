@@ -2,7 +2,30 @@
 -- UUIDs, JSON objects and canonical UTC timestamps are stored as TEXT.
 -- Execute PRAGMA foreign_keys = ON on EVERY application connection.
 -- Names should be trimmed by the control plane before saving.
--- The control plane validates driver-specific config and updates updated_at.
+-- The control plane validates driver-specific config and updates updated_at
+-- on normal application edits. The example.db correction preserves timestamps.
+-- Config ownership and validation (application rules, not extra SQL constraints):
+--   vgateway.config: shared transport/channel/session settings; no poll_interval_ms.
+--   device.config: target/addressing and connection capabilities/profiles;
+--                  no poll_interval_ms and no rpi_ms in connection profiles.
+--   edge_operation.config: acquisition method, addressing and operation timing.
+-- Resolve the driver through edge_operation.device_id -> device.gateway_id
+-- -> vgateway.driver, then validate the driver and operation-specific JSON shape.
+-- Validate disabled records too. Poll intervals are JSON integers greater than 0.
+-- For polling Modbus reads (TCP/RTU/ASCII), require operation poll_interval_ms.
+-- For scheduled EtherNet/IP explicit reads, require operation poll_interval_ms.
+-- EtherNet/IP subscribe_input_only/subscribe_listen_only use operation rpi_ms
+-- greater than 0, without poll_interval_ms; the operation owns the requested RPI.
+-- OPC UA polling read uses operation poll_interval_ms; subscriptions instead use
+-- sampling_interval_ms and publishing_interval_ms (event sampling interval is 0).
+-- Fixed-window OPC UA history_read does not imply polling; preserve its history
+-- parameters, including processing_interval_ms for processed history.
+-- Do not require poll_interval_ms universally for every driver/operation.
+-- example.db contains 4 gateways, 5 devices and 27 operations: 18 polling reads
+-- with poll_interval_ms=1000 (8 TCP, 4 RTU, 5 EtherNet/IP, 1 OPC UA),
+-- and 2 EtherNet/IP subscriptions with operation rpi_ms=100.
+-- ASCII and PROFINET remain allowed drivers but have no rows in this example.
+-- Table definitions, indexes, schema version, UUIDs and relationships are unchanged.
 -- unit_id is optional here; when present it must be a JSON integer 0..255.
 -- The control plane requires unit_id for Modbus and limits serial RTU/ASCII
 -- read targets to 1..247. TCP targets may use 0..255.

@@ -6,12 +6,12 @@ use crate::modbus_tcp::FunctionCode;
 pub struct ModbusTcpCommand {
     pub gateway_id: String,
     pub address: SocketAddr,
-    pub request_timeout_ms: Duration,
-    pub operations: Vec<ModbusTcpOperationCommand>,
+    pub request_timeout: Duration,
+    pub operations: Vec<ModbusTcpEdgeOperationCommand>,
 }
 
 #[derive(Debug)]
-pub struct ModbusTcpOperationCommand {
+pub struct ModbusTcpEdgeOperationCommand {
     pub operation_id: String,
     pub unit_id: u8,
     pub function_code: FunctionCode,

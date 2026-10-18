@@ -1,13 +1,13 @@
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 
 #[derive(Debug)]
 pub struct EdgeOperationRow {
-    id: String,
-    device_id: String,
-    name: String,
-    config: Value,
-    enabled: bool,
+    pub id: String,
+    pub device_id: String,
+    pub name: String,
+    pub config: Value,
+    pub enabled: bool,
 }
 impl EdgeOperationRow {
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
@@ -24,6 +24,16 @@ impl EdgeOperationRow {
         let mut stmt =
             conn.prepare("SELECT id, device_id, name, config, enabled FROM edge_operation")?;
         stmt.query_map([], EdgeOperationRow::from_row)?.collect()
+    }
+
+    pub fn find_all_by_device_id(
+        conn: &Connection,
+        device_id: &str,
+        enabled: bool,
+    ) -> rusqlite::Result<Vec<EdgeOperationRow>> {
+        let mut stmt = conn.prepare("SELECT id, device_id, name, config, enabled FROM edge_operation WHERE device_id = ?1 AND enabled = ?2")?;
+        stmt.query_map(params![device_id, enabled], EdgeOperationRow::from_row)?
+            .collect()
     }
 
     pub fn find_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<EdgeOperationRow>> {
