@@ -2,32 +2,30 @@
 
 Industrial IoT edge runtime in Rust. Early development.
 
-> Why furious? Because "just poll a few registers" is never just polling a few registers.
+> Why furious? everything will be furious when developing in Rust. Including owner's head
 
-Currently supports Modbus TCP FC03/FC04 polling over persistent connections,
-with per-operation Unit IDs, function codes, addresses, quantities, and scan intervals.
+- **Runtime:** polls Modbus TCP (FC03/FC04) over one persistent connection.
+  Exceptions are protocol outcomes, not errors. Last good snapshot survives exceptions and reconnects.
+- **Control plane:** loads config from SQLite (`vgateway -> device -> edge_operation`)
+  and prepares a runtime command. Bad device/operation configs are skipped and reported,
+  not fatal.
 
-Protocol handling uses fixed-size buffers and keeps valid Modbus exceptions as
-protocol outcomes rather than transport errors.
+The two parts are not connected yet.
 
-Each scheduled operation retains its latest successful register snapshot and
-acquisition time. Exceptions and errors do not overwrite it, and it survives reconnect.
+## Design
 
-Failure handling:
+- `[u16; 125]` buffers: FC03/FC04 responses are protocol-bounded, so no per-poll allocation.
+- One request in flight per connection: responses are matched before the next request.
 
-- socket reads time out instead of waiting forever on a silent device
-- invalid responses that leave the stream aligned are skipped; polling continues
-  on the same connection
-- I/O errors and invalid responses that may leave the stream misaligned trigger reconnect
+## Run
 
-18 scripted TCP tests cover the Modbus transaction path, read timeout,
-snapshot retention after exceptions, and continued polling after invalid responses.
-Reconnect has been manually verified by stopping and restarting the server.
+    cargo test                               # no Modbus server needed
+    cargo run --example poll_modbus_tcp      # needs a simulator at 127.0.0.1:10502, Unit IDs 1 and 2
 
-Known limitations: initial connection failure terminates the executable, and
-function codes other than FC03/FC04 are not implemented.
+Sample DB: `sqlite3 local-data/example.db < local-data/schema.sql` then `< local-data/seed.sql`.
 
-```bash
-cargo run
-cargo test
-```
+## Limitations
+
+- Prepared commands are not executed yet.
+- FC03/FC04 only.
+- Control plane has no automated tests yet.
