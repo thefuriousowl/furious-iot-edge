@@ -10,7 +10,7 @@ pub struct ModbusTcpCommand {
     pub operations: Vec<ModbusTcpEdgeOperationCommand>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ModbusTcpEdgeOperationCommand {
     pub operation_id: String,
     pub unit_id: u8,
