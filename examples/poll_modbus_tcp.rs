@@ -27,15 +27,17 @@ fn main() -> Result<(), ModbusError> {
         ModbusOperation::new(0x02, ReadInputRegisters, 100, 2).expect("should be valid");
 
     let scheduled_operation_fc03 =
-        ScheduledOp::new(operation_fc03, Duration::from_millis(1000)).expect("valid scheduled_op");
+        ScheduledOp::new("op-1", operation_fc03, Duration::from_millis(1000))
+            .expect("valid scheduled_op");
     let scheduled_operation_fc04 =
-        ScheduledOp::new(operation_fc04, Duration::from_millis(5000)).expect("valid scheduled_op");
+        ScheduledOp::new("op-2", operation_fc04, Duration::from_millis(5000))
+            .expect("valid scheduled_op");
     let scheduled_another_fc04_operation =
-        ScheduledOp::new(another_fc04_operation, Duration::from_millis(3000))
+        ScheduledOp::new("op-3", another_fc04_operation, Duration::from_millis(3000))
             .expect("valid scheduled_op");
 
     let scheduled_exception_operation =
-        ScheduledOp::new(exception_operation, Duration::from_millis(2000))
+        ScheduledOp::new("op-4", exception_operation, Duration::from_millis(2000))
             .expect("valid scheduled_op");
 
     let mut scheduler = Scheduler::new();

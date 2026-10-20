@@ -25,17 +25,19 @@ impl RegisterSnapshot {
 }
 #[derive(Debug)]
 pub struct ScheduledOp {
+    operation_id: String,
     operation: ModbusOperation,
     interval: Duration,
     next_due: Instant,
     last_success: Option<RegisterSnapshot>,
 }
 impl ScheduledOp {
-    pub fn new(operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
+    pub fn new(id: &str, operation: ModbusOperation, interval: Duration) -> Result<Self, String> {
         if interval < MIN_ALLOW_INTERVAL {
             return Err(format!("interval must be at least {MIN_ALLOW_INTERVAL:?}"));
         }
         Ok(Self {
+            operation_id: id.to_string(),
             operation,
             interval,
             next_due: Instant::now(),
@@ -71,6 +73,10 @@ impl ScheduledOp {
             None => None,
             Some(snapshot) => Some((&snapshot.data[..snapshot.count], snapshot.acquired_at)),
         }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
     }
 }
 

@@ -26,7 +26,7 @@ fn main() -> ExitCode {
             op.quantity,
         )
         .unwrap();
-        let sch_op = ScheduledOp::new(operation, op.poll_interval).unwrap();
+        let sch_op = ScheduledOp::new(&op.operation_id, operation, op.poll_interval).unwrap();
         scheduler.add_operation(sch_op);
     });
     let mut session = match ModbusSession::connect(&cmd.address.to_string(), cmd.request_timeout) {

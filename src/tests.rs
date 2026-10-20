@@ -83,8 +83,8 @@ fn invalid_response_on_usable_connection_keeps_polling() {
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let scheduled_operation =
-        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+        .expect("valid scheduled operation");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
     let result = scheduler.run_all(&mut session);
@@ -156,8 +156,8 @@ fn persist_success_operation_snapshot_after_exception_occurred() {
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let scheduled_operation =
-        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+        .expect("valid scheduled operation");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
     let result = scheduler.run_all(&mut session);
@@ -921,8 +921,8 @@ fn transaction_id_mismatch_keeps_seeded_snapshot() {
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let mut scheduled_operation =
-        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let mut scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+        .expect("valid scheduled operation");
 
     let mut scheduler = Scheduler::new();
 
@@ -968,8 +968,8 @@ fn last_success_stays_none_after_first_poll_exception() {
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let scheduled_operation =
-        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+        .expect("valid scheduled operation");
 
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
@@ -1005,8 +1005,8 @@ fn last_success_stays_none_after_first_poll_transaction_id_mismatch() {
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let scheduled_operation =
-        ScheduledOp::new(operation, Duration::from_millis(100)).expect("valid scheduled operation");
+    let scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+        .expect("valid scheduled operation");
 
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
@@ -1047,13 +1047,16 @@ fn update_collect_operation() {
             ],
         );
     });
-
+    let expected_op_1_id = "op-1";
+    let expected_op_2_id = "op-2";
     let operation_a = ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid operation");
     let scheduled_op_a =
-        ScheduledOp::new(operation_a, Duration::from_millis(1000)).expect("valid scheduled op");
+        ScheduledOp::new(expected_op_1_id, operation_a, Duration::from_millis(1000))
+            .expect("valid scheduled op");
     let operation_b = ModbusOperation::new(2, ReadInputRegisters, 0, 1).expect("valid operation");
     let scheduled_op_b =
-        ScheduledOp::new(operation_b, Duration::from_millis(1000)).expect("valid scheduled op");
+        ScheduledOp::new(expected_op_2_id, operation_b, Duration::from_millis(1000))
+            .expect("valid scheduled op");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_op_a);
     scheduler.add_operation(scheduled_op_b);
@@ -1064,6 +1067,8 @@ fn update_collect_operation() {
         .last_success()
         .expect("registers snapshot should match op a");
     assert_eq!(registers, &[10u16, 20][..]);
+    assert_eq!(scheduler.ops()[0].operation_id(), expected_op_1_id);
+    assert_eq!(scheduler.ops()[1].operation_id(), expected_op_2_id);
     let (registers, _) = scheduler.ops()[1]
         .last_success()
         .expect("registers snapshot should match op b");
