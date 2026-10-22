@@ -5,6 +5,7 @@ use furious_iot_edge::{
     db_model::vgateway::VGatewayRow,
     modbus_tcp::{ModbusOperation, ModbusSession},
     scheduler::{ScheduledOp, Scheduler},
+    shared_state::SnapshotStore,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -36,8 +37,9 @@ fn main() -> ExitCode {
             connect_with_retry(&cmd.address.to_string(), cmd.request_timeout)
         }
     };
+    let store = SnapshotStore::new();
     loop {
-        if let Err(error) = scheduler.run_all(&mut session) {
+        if let Err(error) = scheduler.run_all(&mut session, &store) {
             eprintln!("Connection error: {error}");
             session = connect_with_retry(&cmd.address.to_string(), cmd.request_timeout);
         }

@@ -6,6 +6,7 @@ use furious_iot_edge::{
         ModbusError, ModbusOperation, ModbusSession,
     },
     scheduler::{ScheduledOp, Scheduler},
+    shared_state::SnapshotStore,
 };
 
 const TEMP_READ_TIMEOUT: Duration = Duration::from_millis(3000);
@@ -41,12 +42,13 @@ fn main() -> Result<(), ModbusError> {
             .expect("valid scheduled_op");
 
     let mut scheduler = Scheduler::new();
+    let store = SnapshotStore::new();
     scheduler.add_operation(scheduled_operation_fc03);
     scheduler.add_operation(scheduled_operation_fc04);
     scheduler.add_operation(scheduled_another_fc04_operation);
     scheduler.add_operation(scheduled_exception_operation);
     loop {
-        match scheduler.run_all(&mut session) {
+        match scheduler.run_all(&mut session, &store) {
             Err(error) => {
                 eprintln!("Connection error: {error}");
                 session = connect_with_retry("127.0.0.1:10502", TEMP_READ_TIMEOUT);

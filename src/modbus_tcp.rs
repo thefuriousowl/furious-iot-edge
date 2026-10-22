@@ -145,10 +145,7 @@ impl ModbusSession {
         Ok(ModbusResponse::Exception(exception))
     }
 
-    pub(crate) fn execute(
-        &mut self,
-        operation: &ModbusOperation,
-    ) -> Result<ModbusResponse, ModbusError> {
+    pub fn execute(&mut self, operation: &ModbusOperation) -> Result<ModbusResponse, ModbusError> {
         let mut req_pdu = [0u8; 5];
         req_pdu[0] = operation.function_code() as u8;
         req_pdu[1..3].copy_from_slice(&operation.starting_address().to_be_bytes());

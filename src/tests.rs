@@ -4,6 +4,7 @@ use crate::{
         ModbusError, ModbusException, ModbusOperation, ModbusSession,
     },
     scheduler::{ScheduledOp, Scheduler},
+    shared_state::{RegisterSnapshot, SnapshotStore},
 };
 use std::{
     io::{Read, Write},
@@ -47,36 +48,74 @@ fn create_tcp_test_client(server_addr: SocketAddr) -> ModbusSession {
     ModbusSession::connect(&server_addr.to_string(), GLOBAL_TEST_READ_TIMEOUT)
         .expect("should connect to test server")
 }
+
+fn retained(store: &SnapshotStore, operation_id: &str) -> Option<Vec<u16>> {
+    store
+        .get(operation_id)
+        .map(|snapshot| snapshot.registers().to_vec())
+}
+
+fn read_request(tid: u16, uid: u8, fc: u8, start: u16, qty: u16) -> [u8; 12] {
+    let mut bytes = [0u8; 12];
+    bytes[0..2].copy_from_slice(&tid.to_be_bytes());
+    bytes[4..6].copy_from_slice(&(6u16).to_be_bytes());
+    bytes[6] = uid;
+    bytes[7] = fc;
+    bytes[8..10].copy_from_slice(&start.to_be_bytes());
+    bytes[10..12].copy_from_slice(&qty.to_be_bytes());
+    bytes
+}
+
+fn fc03_request(tid: u16, uid: u8, start: u16, qty: u16) -> [u8; 12] {
+    read_request(tid, uid, 0x03, start, qty)
+}
+fn fc04_request(tid: u16, uid: u8, start: u16, qty: u16) -> [u8; 12] {
+    read_request(tid, uid, 0x04, start, qty)
+}
+
+fn register_response(tid: u16, uid: u8, fc: u8, registers: &[u16]) -> Vec<u8> {
+    let byte_count = (registers.len() * 2) as u8;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&tid.to_be_bytes());
+    bytes.extend_from_slice(&(0u16).to_be_bytes()); // PID
+    bytes.extend_from_slice(&(3 + (byte_count as u16)).to_be_bytes()); // UID + FC + ByteCount + data
+    bytes.push(uid);
+    bytes.push(fc);
+    bytes.push(byte_count);
+    for r in registers {
+        bytes.extend_from_slice(&r.to_be_bytes());
+    }
+    bytes
+}
+
+fn exception_response(tid: u16, uid: u8, fc: u8, code: u8) -> Vec<u8> {
+    // MBAP Length = 3 (UID + FC | 0x80 + exception code)
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&tid.to_be_bytes());
+    bytes.extend_from_slice(&(0u16).to_be_bytes());
+    bytes.extend_from_slice(&(3u16).to_be_bytes());
+    bytes.push(uid);
+    bytes.push(0x80 | fc);
+    bytes.push(code);
+    bytes
+}
+
 #[test]
 fn invalid_response_on_usable_connection_keeps_polling() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
-        let expected_first_request = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-        let first_valid_fc03_response = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        let expected_second_request = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-        let invalid_byte_count_fc03_response = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x03, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        let expected_third_request = [
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-        let second_valid_fc03_response = [
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x1e, 0x00, 0x28,
-        ];
-
+        let first_req = fc03_request(0, 1, 0, 2);
+        let first_res_valid = register_response(0, 1, 3, &[10, 20]);
+        let second_req = fc03_request(1, 1, 0, 2);
+        let mut second_res_invalid_byte_count = register_response(1, 1, 3, &[30, 40]);
+        second_res_invalid_byte_count[8] = 0x03;
+        let third_req = fc03_request(2, 1, 0, 2);
+        let third_res_valid = register_response(2, 1, 3, &[50, 60]);
         serve_exchanges(
             server_stream,
             &[
-                (expected_first_request, &first_valid_fc03_response),
-                (expected_second_request, &invalid_byte_count_fc03_response),
-                (expected_third_request, &second_valid_fc03_response),
+                (first_req, &first_res_valid),
+                (second_req, &second_res_invalid_byte_count),
+                (third_req, &third_res_valid),
             ],
         )
     });
@@ -87,14 +126,10 @@ fn invalid_response_on_usable_connection_keeps_polling() {
         .expect("valid scheduled operation");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
-    let result = scheduler.run_all(&mut session);
+    let store = SnapshotStore::new();
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(result, Err(ModbusError::Io(_))));
-    let (registers, _) = scheduler.ops()[0]
-        .last_success()
-        .expect("snapshot should still exist after invalid response");
-
-    assert_eq!(registers, &[30u16, 40][..]);
-
+    assert_eq!(retained(&store, "op-1"), Some(vec![50, 60]));
     server_thread.join().expect("server panicked or failed");
 }
 
@@ -125,32 +160,19 @@ fn silent_server_returns_read_timeout_error() {
 }
 #[test]
 fn persist_success_operation_snapshot_after_exception_occurred() {
-    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-    let server_addr = server
-        .local_addr()
-        .expect("should get local server address");
-    let server_thread = thread::spawn(move || {
-        let (mut server_stream, _) = server.accept().expect("should accept client connection");
-        let mut request = [0u8; 12];
+    let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
+        let first_fc03_req_valid = fc03_request(0, 1, 0, 2);
+        let first_fc03_res_valid = register_response(0, 1, 3, &[10u16, 20]);
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
+        let second_fc03_exception_valid = exception_response(1, 1, 3, 2);
 
-        server_stream
-            .read_exact(&mut request)
-            .expect("should read request");
-        let valid_fc03_response = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        server_stream
-            .write_all(&valid_fc03_response)
-            .expect("should write response");
-
-        server_stream
-            .read_exact(&mut request)
-            .expect("should read request");
-        let exception_response_adu = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
-        server_stream
-            .write_all(&exception_response_adu)
-            .expect("should write response");
+        serve_exchanges(
+            server_stream,
+            &[
+                (first_fc03_req_valid, &first_fc03_res_valid),
+                (second_fc03_req_valid, &second_fc03_exception_valid),
+            ],
+        );
     });
 
     let operation =
@@ -160,13 +182,10 @@ fn persist_success_operation_snapshot_after_exception_occurred() {
         .expect("valid scheduled operation");
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
-    let result = scheduler.run_all(&mut session);
+    let store = SnapshotStore::new();
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(result, Err(ModbusError::Io(_))));
-    let (registers, _) = scheduler.ops()[0]
-        .last_success()
-        .expect("snapshot should still exist after exception");
-    assert_eq!(registers, &[10u16, 20][..]);
-
+    assert_eq!(retained(&store, "op-1"), Some(vec![10u16, 20]));
     server_thread.join().expect("server panicked or failed");
 }
 #[test]
@@ -176,17 +195,13 @@ fn reject_incomplete_mbap_header() {
         server_stream
             .read_exact(&mut request)
             .expect("should read request");
-
         // TID: 0, PID: 0, LENGTH: 7, missing unit ID
         let incomplete_response = [0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
-
         server_stream
             .write_all(&incomplete_response)
             .expect("should write partial response");
-
         drop(server_stream);
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 3).expect("valid fc03 operation");
@@ -213,23 +228,20 @@ fn reject_invalid_mbap_length() {
             server_stream
                 .read_exact(&mut request_buf)
                 .expect("should read request");
-            let expected_request_fc03_adu = [
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-            ];
-            assert_eq!(expected_request_fc03_adu, request_buf);
+            let fc03_req_valid = fc03_request(0, 1, 0, 2);
+            assert_eq!(fc03_req_valid, request_buf);
             // TID: 0, PID: 0, LENGTH: invalid_mbap_lengths[i], UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
-            let mut invalid_length_fc03_response = [0u8; 13];
-            invalid_length_fc03_response[0..2].copy_from_slice(&(0u16).to_be_bytes());
-            invalid_length_fc03_response[2..4].copy_from_slice(&(0u16).to_be_bytes());
-            invalid_length_fc03_response[4..6].copy_from_slice(&item.to_be_bytes());
-            invalid_length_fc03_response[6] = 0x01;
-            invalid_length_fc03_response[7] = 0x03;
-            invalid_length_fc03_response[8] = 0x04;
-            invalid_length_fc03_response[9..11].copy_from_slice(&(10u16).to_be_bytes());
-            invalid_length_fc03_response[11..13].copy_from_slice(&(20u16).to_be_bytes());
-
+            let mut invalid_length_fc03_res = [0u8; 13];
+            invalid_length_fc03_res[0..2].copy_from_slice(&(0u16).to_be_bytes());
+            invalid_length_fc03_res[2..4].copy_from_slice(&(0u16).to_be_bytes());
+            invalid_length_fc03_res[4..6].copy_from_slice(&item.to_be_bytes());
+            invalid_length_fc03_res[6] = 0x01;
+            invalid_length_fc03_res[7] = 0x03;
+            invalid_length_fc03_res[8] = 0x04;
+            invalid_length_fc03_res[9..11].copy_from_slice(&(10u16).to_be_bytes());
+            invalid_length_fc03_res[11..13].copy_from_slice(&(20u16).to_be_bytes());
             server_stream
-                .write_all(&invalid_length_fc03_response)
+                .write_all(&invalid_length_fc03_res)
                 .expect("should write response");
         }
     });
@@ -282,33 +294,19 @@ fn reject_invalid_mbap_length() {
 fn short_pdu_then_valid_fc03_on_same_connection() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_first_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
+        let first_fc03_req_valid = fc03_request(0, 1, 0, 2);
         let truncated_exception_byte_pdu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x83];
-
-        let expected_second_request_fc03_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
-        let valid_fc03_response = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
+        let second_fc03_res_valid = register_response(1, 1, 3, &[10u16, 20]);
         serve_exchanges(
             server_stream,
             &[
-                (
-                    expected_first_request_fc03_adu,
-                    &truncated_exception_byte_pdu,
-                ),
-                (expected_second_request_fc03_adu, &valid_fc03_response),
+                (first_fc03_req_valid, &truncated_exception_byte_pdu),
+                (second_fc03_req_valid, &second_fc03_res_valid),
             ],
         );
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid FC03 operation");
@@ -327,30 +325,18 @@ fn short_pdu_then_valid_fc03_on_same_connection() {
 fn success_transaction_after_reject_malformed_exception() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_first_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
-        let exceeded_exception_byte_adu =
-            [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x83, 0x02, 0x00];
-
-        let expected_second_request_fc03_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
+        let first_fc03_req_valid = fc03_request(0, 1, 0, 2);
+        let mut first_valid_exception_res = exception_response(0, 1, 3, 2);
+        first_valid_exception_res.extend_from_slice(&[0x00]);
+        first_valid_exception_res[4..6].copy_from_slice(&(4u16).to_be_bytes());
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
-        let valid_fc03_response = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
+        let second_fc03_res_valid = register_response(1, 1, 3, &[10u16, 20]);
         serve_exchanges(
             server_stream,
             &[
-                (
-                    expected_first_request_fc03_adu,
-                    &exceeded_exception_byte_adu,
-                ),
-                (expected_second_request_fc03_adu, &valid_fc03_response),
+                (first_fc03_req_valid, &first_valid_exception_res),
+                (second_fc03_req_valid, &second_fc03_res_valid),
             ],
         );
     });
@@ -380,20 +366,16 @@ fn reject_truncated_response_from_unexpected_connection_close() {
         server_stream
             .read_exact(&mut request)
             .expect("should read request");
-
         // TID: 0, PID: 0, LENGTH: 7, UnitID: 1
         // declared 6 bytes PDU but actual sent 4 bytes
         let incomplete_response = [
             0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a,
         ];
-
         server_stream
             .write_all(&incomplete_response)
             .expect("should write partial response");
-
         drop(server_stream);
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 3).expect("valid fc03 operation");
@@ -410,20 +392,11 @@ fn reject_truncated_response_from_unexpected_connection_close() {
 fn reject_mismatch_unit_id() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let fc03_req_valid = fc03_request(0, 1, 0, 2);
         // TID: 0, PID: 0, LENGTH: 7, UnitID: 2, FC: 3, ByteCount: 4, Data: [10, 20]
-        let mismatch_uid_fc03_response = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        serve_exchanges(
-            server_stream,
-            &[(expected_request_fc03_adu, &mismatch_uid_fc03_response)],
-        );
+        let fc03_res_uid_mismatch = register_response(0, 2, 3, &[10u16, 20]);
+        serve_exchanges(server_stream, &[(fc03_req_valid, &fc03_res_uid_mismatch)]);
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid FC03 operation");
@@ -435,32 +408,23 @@ fn reject_mismatch_unit_id() {
             found: 2,
         })
     ));
-
     server_thread.join().expect("server thread panic or failed");
 }
 #[test]
 fn reject_mismatch_protocol_id() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let fc03_req_valid = fc03_request(0, 1, 0, 2);
         // TID: 0, PID: 1, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
-        let mismatch_pid_fc03_response = [
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
+        let mut fc03_res_mismatch_pid = register_response(0, 1, 3, &[10u16, 20]);
+        fc03_res_mismatch_pid[2..4].copy_from_slice(&(1u16).to_be_bytes());
 
-        serve_exchanges(
-            server_stream,
-            &[(expected_request_fc03_adu, &mismatch_pid_fc03_response)],
-        );
+        serve_exchanges(server_stream, &[(fc03_req_valid, &fc03_res_mismatch_pid)]);
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid FC03 operation");
     let response = session.execute(&operation);
-
     assert!(matches!(
         response,
         Err(ModbusError::InvalidProtocolId {
@@ -474,20 +438,11 @@ fn reject_mismatch_protocol_id() {
 fn reject_mismatch_transaction_id() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_fc03_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let fc03_req_valid = fc03_request(0, 1, 0, 2);
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Data: [10, 20]
-        let mismatch_tid_fc03_response = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        serve_exchanges(
-            server_stream,
-            &[(expected_request_fc03_adu, &mismatch_tid_fc03_response)],
-        );
+        let fc03_res_mismatch_tid = register_response(1, 1, 3, &[10u16, 20]);
+        serve_exchanges(server_stream, &[(fc03_req_valid, &fc03_res_mismatch_tid)]);
     });
-
     let mut session = create_tcp_test_client(server_addr);
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid FC03 operation");
@@ -506,36 +461,21 @@ fn reject_mismatch_transaction_id() {
 fn reject_byte_count_mismatch_quantity() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_first_request_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let first_fc03_req_valid = fc03_request(0, 1, 0, 2);
         // Requested quantity: 2 registers (4 data bytes); response Byte Count: 2.
         // TID: 0, PID: 0, LENGTH: 5, UnitID: 1, FC: 3, ByteCount: 2, Registers: [10]
-        let mismatch_byte_count_response_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x0a,
-        ];
-
+        let first_fc03_res_quantity_mismatch = register_response(0, 1, 3, &[10u16]);
         // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_second_request_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
         // Response Byte Count: 4; actual response data: 2 bytes (1 register).
         // TID: 1, PID: 0, LENGTH: 5, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10]
-        let mismatch_data_bytes_len_response_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x04, 0x00, 0x0a,
-        ];
-
+        let mut second_fc03_res_byte_count_mismatch = register_response(1, 1, 3, &[10u16]);
+        second_fc03_res_byte_count_mismatch[8] = 0x04;
         serve_exchanges(
             server_stream,
             &[
-                (
-                    expected_first_request_adu,
-                    &mismatch_byte_count_response_adu,
-                ),
-                (
-                    expected_second_request_adu,
-                    &mismatch_data_bytes_len_response_adu,
-                ),
+                (first_fc03_req_valid, &first_fc03_res_quantity_mismatch),
+                (second_fc03_req_valid, &second_fc03_res_byte_count_mismatch),
             ],
         );
     });
@@ -567,54 +507,32 @@ fn reject_byte_count_mismatch_quantity() {
 fn reject_mismatch_fc() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 0, Quantity: 2
-        let expected_first_request = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let first_fc04_req_valid = fc04_request(0, 1, 0, 2);
         // request fc04 but response fc03
         // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
-        let mismatch_fc03_response_adu = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
+        let first_res_mismatch_fc = register_response(0, 1, 3, &[10u16, 20]);
         // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_second_request = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
         // request fc03 but response fc04
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
-        let mismatch_fc04_response_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
+        let second_res_mismatch_fc = register_response(1, 1, 4, &[10u16, 20]);
         // TID: 2, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_third_request = [
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let third_fc03_req_valid = fc03_request(2, 1, 0, 2);
         // request fc03 but response fc04 exception
         // TID: 2, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
-        let mismatch_fc04_exception_response_adu =
-            [0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
-
+        let third_res_mismatch_fc_exception = exception_response(2, 1, 4, 2);
         // TID: 3, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 0, Quantity: 2
-        let expected_forth_request = [
-            0x00, 0x03, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let fourth_fc04_req_valid = fc04_request(3, 1, 0, 2);
         // request fc04 but response fc03 exception
         // TID: 3, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
-        let mismatch_fc03_exception_response_adu =
-            [0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
-
+        let fourth_res_mismatch_fc_exception = exception_response(3, 1, 3, 2);
         serve_exchanges(
             server_stream,
             &[
-                (expected_first_request, &mismatch_fc03_response_adu),
-                (expected_second_request, &mismatch_fc04_response_adu),
-                (
-                    expected_third_request,
-                    &mismatch_fc04_exception_response_adu,
-                ),
-                (
-                    expected_forth_request,
-                    &mismatch_fc03_exception_response_adu,
-                ),
+                (first_fc04_req_valid, &first_res_mismatch_fc),
+                (second_fc03_req_valid, &second_res_mismatch_fc),
+                (third_fc03_req_valid, &third_res_mismatch_fc_exception),
+                (fourth_fc04_req_valid, &fourth_res_mismatch_fc_exception),
             ],
         );
     });
@@ -672,27 +590,18 @@ fn reject_mismatch_fc() {
 fn exception_then_valid_fc04_on_same_connection() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 16, Quantity: 2
-        let expected_first_request = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x02,
-        ];
-
+        let first_fc03_req_valid = fc04_request(0, 1, 16, 2);
         // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x04), ExceptionCode: 2
-        let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x84, 0x02];
-
+        let first_fc04_exception_valid = exception_response(0, 1, 4, 2);
         // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 4, Start: 16, Quantity: 2
-        let expected_second_request = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x02,
-        ];
+        let second_fc04_req_valid = fc04_request(1, 1, 16, 2);
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 4, ByteCount: 4, Registers: [10, 20]
-        let valid_fc04_response_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
+        let second_fc04_res_valid = register_response(1, 1, 4, &[10u16, 20]);
         serve_exchanges(
             server_stream,
             &[
-                (expected_first_request, &exception_response_adu),
-                (expected_second_request, &valid_fc04_response_adu),
+                (first_fc03_req_valid, &first_fc04_exception_valid),
+                (second_fc04_req_valid, &second_fc04_res_valid),
             ],
         );
     });
@@ -773,18 +682,12 @@ fn different_fc_operations_on_same_connection() {
 fn valid_fc03_round_trip() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_adu: [u8; 12] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
+        let fc03_req_valid = fc03_request(0, 1, 0, 2);
         // Modbus TCP Response ADU (2 registers = 4 bytes response data)
         // Header (7B) + FC (1B) + Byte Count (1B) + Register Data (4B) = 13 bytes
         // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
-        let response_adu: [u8; 13] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        serve_exchanges(server_stream, &[(expected_request_adu, &response_adu)]);
+        let fc03_res_valid = register_response(0, 1, 3, &[10u16, 20]);
+        serve_exchanges(server_stream, &[(fc03_req_valid, &fc03_res_valid)]);
     });
 
     let mut session = create_tcp_test_client(server_addr);
@@ -802,26 +705,18 @@ fn valid_fc03_round_trip() {
 fn exception_then_valid_fc03_on_same_connection() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_first_request = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let first_fc03_req_valid = fc03_request(0, 1, 0, 2);
         // TID: 0, PID: 0, LENGTH: 3, UnitID: 1, FC: Exception (0x80 | 0x03), ExceptionCode: 2
-        let exception_response_adu = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
-
+        let first_exception_res_valid = exception_response(0, 1, 3, 2);
         // TID: 1, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_second_request = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let second_fc03_req_valid = fc03_request(1, 1, 0, 2);
         // TID: 1, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
-        let normal_response_adu = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
+        let second_fc03_res_valid = register_response(1, 1, 3, &[10u16, 20]);
         serve_exchanges(
             server_stream,
             &[
-                (expected_first_request, &exception_response_adu),
-                (expected_second_request, &normal_response_adu),
+                (first_fc03_req_valid, &first_exception_res_valid),
+                (second_fc03_req_valid, &second_fc03_res_valid),
             ],
         );
     });
@@ -853,27 +748,18 @@ fn exception_then_valid_fc03_on_same_connection() {
 fn different_fc03_operations_on_same_connection() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
         // TID: 0, PID: 0, LENGTH: 6, UnitID: 1, FC: 3, Start: 0, Quantity: 2
-        let expected_request_from_op_a = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
+        let op_a_fc03_req_valid = fc03_request(0, 1, 0, 2);
         // TID: 0, PID: 0, LENGTH: 7, UnitID: 1, FC: 3, ByteCount: 4, Registers: [10, 20]
-        let expected_response_for_op_a = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
+        let op_a_fc03_res_valid = register_response(0, 1, 3, &[10u16, 20]);
         // TID: 1, PID: 0, LENGTH: 6, UnitID: 2, FC: 3, Start: 10, Quantity: 1
-        let expected_request_from_op_b = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x03, 0x00, 0x0a, 0x00, 0x01,
-        ];
+        let op_b_fc03_req_valid = fc03_request(1, 2, 10, 1);
         // TID: 1, PID: 0, LENGTH: 5, UnitID: 2, FC: 3, ByteCount: 2, Registers: [30]
-        let expected_response_for_op_b = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x03, 0x02, 0x00, 0x1e,
-        ];
-
+        let op_b_fc03_res_valid = register_response(1, 2, 3, &[30u16]);
         serve_exchanges(
             server_stream,
             &[
-                (expected_request_from_op_a, &expected_response_for_op_a),
-                (expected_request_from_op_b, &expected_response_for_op_b),
+                (op_a_fc03_req_valid, &op_a_fc03_res_valid),
+                (op_b_fc03_req_valid, &op_b_fc03_res_valid),
             ],
         );
     });
@@ -898,30 +784,17 @@ fn different_fc03_operations_on_same_connection() {
 }
 #[test]
 fn transaction_id_mismatch_keeps_seeded_snapshot() {
-    let server = TcpListener::bind("127.0.0.1:0").expect("should bind test server");
-    let server_addr = server
-        .local_addr()
-        .expect("should get local server address");
-    let server_thread = thread::spawn(move || {
-        let (mut server_stream, _) = server.accept().expect("should accept client connection");
-        let mut request = [0u8; 12];
+    let (server_addr, server_thread) = create_tcp_test_server(|stream| {
+        let request = fc03_request(0, 1, 0, 2);
+        let response = register_response(5, 1, 3, &[30, 40]);
 
-        server_stream
-            .read_exact(&mut request)
-            .expect("should read request");
-
-        let invalid_fc03_response = [
-            0x00, 0x05, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x1e, 0x00, 0x28,
-        ];
-        server_stream
-            .write_all(&invalid_fc03_response)
-            .expect("should write response");
+        serve_exchanges(stream, &[(request, &response)]);
     });
 
     let operation =
         ModbusOperation::new(1, ReadHoldingRegisters, 0, 2).expect("valid fc03 request");
     let mut session = create_tcp_test_client(server_addr);
-    let mut scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
+    let scheduled_operation = ScheduledOp::new("op-1", operation, Duration::from_millis(100))
         .expect("valid scheduled operation");
 
     let mut scheduler = Scheduler::new();
@@ -930,19 +803,21 @@ fn transaction_id_mismatch_keeps_seeded_snapshot() {
     data[0] = 10;
     data[1] = 20;
     let seeded_at = Instant::now();
-    scheduled_operation.store_registers_snapshot(data, 2, seeded_at);
-
+    let store = SnapshotStore::new();
+    store.put("op-1", RegisterSnapshot::from(data, 2, seeded_at));
     scheduler.add_operation(scheduled_operation);
-    let result = scheduler.run_all(&mut session);
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(
         result,
-        Err(ModbusError::TransactionIdMismatch { .. })
+        Err(ModbusError::TransactionIdMismatch {
+            expected: 0,
+            found: 5,
+        })
     ));
-    let (registers, acquired_at) = scheduler.ops()[0]
-        .last_success()
-        .expect("seeded snapshot should remain");
-    assert_eq!(registers, &[10u16, 20][..]);
-    assert_eq!(acquired_at, seeded_at);
+
+    let snapshot = store.get("op-1").expect("seeded snapshot should remain");
+    assert_eq!(snapshot.registers(), &[10u16, 20]);
+    assert_eq!(snapshot.acquired_at(), seeded_at);
 
     server_thread.join().expect("server panicked or failed");
 }
@@ -973,9 +848,10 @@ fn last_success_stays_none_after_first_poll_exception() {
 
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
-    let result = scheduler.run_all(&mut session);
+    let store = SnapshotStore::new();
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(result, Err(ModbusError::Io(_))));
-    assert!(scheduler.ops()[0].last_success().is_none());
+    assert_eq!(retained(&store, "op-1"), None);
 
     server_thread.join().expect("server panicked or failed");
 }
@@ -1010,40 +886,28 @@ fn last_success_stays_none_after_first_poll_transaction_id_mismatch() {
 
     let mut scheduler = Scheduler::new();
     scheduler.add_operation(scheduled_operation);
-    let result = scheduler.run_all(&mut session);
+    let store = SnapshotStore::new();
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(
         result,
         Err(ModbusError::TransactionIdMismatch { .. })
     ));
-    assert!(scheduler.ops()[0].last_success().is_none());
-
+    assert_eq!(retained(&store, "op-1"), None);
     server_thread.join().expect("server panicked or failed");
 }
 
 #[test]
 fn update_collect_operation() {
     let (server_addr, server_thread) = create_tcp_test_server(move |server_stream| {
-        let expected_request_op_a = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02,
-        ];
-
-        let valid_response_op_a = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x01, 0x03, 0x04, 0x00, 0x0a, 0x00, 0x14,
-        ];
-
-        let expected_request_op_b = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00, 0x01,
-        ];
-
-        let valid_response_op_b = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x02, 0x04, 0x02, 0x00, 0x1e,
-        ];
-
+        let op_a_fc03_req_valid = fc03_request(0, 1, 0, 2);
+        let op_a_fc03_res_valid = register_response(0, 1, 3, &[10u16, 20]);
+        let op_b_fc04_req_valid = fc04_request(1, 2, 0, 1);
+        let op_b_fc04_res_valid = register_response(1, 2, 4, &[30u16]);
         serve_exchanges(
             server_stream,
             &[
-                (expected_request_op_a, &valid_response_op_a),
-                (expected_request_op_b, &valid_response_op_b),
+                (op_a_fc03_req_valid, &op_a_fc03_res_valid),
+                (op_b_fc04_req_valid, &op_b_fc04_res_valid),
             ],
         );
     });
@@ -1061,18 +925,13 @@ fn update_collect_operation() {
     scheduler.add_operation(scheduled_op_a);
     scheduler.add_operation(scheduled_op_b);
     let mut session = create_tcp_test_client(server_addr);
-    let result = scheduler.run_all(&mut session);
+    let store = SnapshotStore::new();
+    let result = scheduler.run_all(&mut session, &store);
     assert!(matches!(result, Err(ModbusError::Io(..))));
-    let (registers, _) = scheduler.ops()[0]
-        .last_success()
-        .expect("registers snapshot should match op a");
-    assert_eq!(registers, &[10u16, 20][..]);
+    assert_eq!(retained(&store, expected_op_1_id), Some(vec![10u16, 20]));
     assert_eq!(scheduler.ops()[0].operation_id(), expected_op_1_id);
     assert_eq!(scheduler.ops()[1].operation_id(), expected_op_2_id);
-    let (registers, _) = scheduler.ops()[1]
-        .last_success()
-        .expect("registers snapshot should match op b");
-    assert_eq!(registers, &[30u16][..]);
+    assert_eq!(retained(&store, expected_op_2_id), Some(vec![30u16]));
     server_thread
         .join()
         .expect("server thread panicked or failed");
