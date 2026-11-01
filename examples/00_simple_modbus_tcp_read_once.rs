@@ -3,15 +3,31 @@ use std::{
     net::TcpStream,
 };
 
-
 const MBAP_HEADER_LEN: usize = 7;
 fn main() {
     let mut client_stream = TcpStream::connect("127.0.0.1:10502").unwrap();
 
-    // PDU
+    // // FC03,04
+    // let request_fc: u8 = 3;
+    // assert!(matches!(request_fc, 0x03 | 0x04));
+    // let request_starting_address: u16 = 0;
+    // let request_quantity: u16 = 16;
+    // assert!((1..=125).contains(&request_quantity));
+    // assert!(u32::from(request_starting_address) + u32::from(request_quantity) <= 65536);
+    // let mut request_pdu = [0u8; 5];
+    // request_pdu[0] = request_fc;
+    // request_pdu[1..3].copy_from_slice(&request_starting_address.to_be_bytes());
+    // request_pdu[3..5].copy_from_slice(&request_quantity.to_be_bytes());
+
+    //////////////////
+
+    // FC01,02
     let request_fc: u8 = 1;
+    assert!(matches!(request_fc, 0x01 | 0x02));
     let request_starting_address: u16 = 0;
-    let request_quantity: u16 = 16;
+    let request_quantity: u16 = 2000; //
+    assert!((1..=2000).contains(&request_quantity));
+    assert!(u32::from(request_starting_address) + u32::from(request_quantity) <= 65536);
     let mut request_pdu = [0u8; 5];
     request_pdu[0] = request_fc;
     request_pdu[1..3].copy_from_slice(&request_starting_address.to_be_bytes());
@@ -39,18 +55,9 @@ fn main() {
     client_stream.read_exact(&mut response_mbap).unwrap();
 
     let response_length = u16::from_be_bytes([response_mbap[4], response_mbap[5]]);
-    if !(2..254).contains(&response_length) {
-        eprintln!("Error: Invalid response MBAP Length");
-    }
+    assert!((3..=254).contains(&response_length));
 
     let response_pdu_len = usize::from(response_length - 1);
-    if response_pdu_len < 2 {
-        if response_pdu_len == 1 {
-            let mut _thrash_byte = [0u8; 1];
-            client_stream.read_exact(&mut _thrash_byte).unwrap();
-        }
-        eprintln!("Error: PDU truncated");
-    }
 
     let mut response_pdu = [0u8; 253];
 
@@ -60,58 +67,36 @@ fn main() {
 
     // Read and validate response transaction ID
     let response_tid = u16::from_be_bytes([response_mbap[0], response_mbap[1]]);
-    if response_tid != request_tid {
-        eprintln!("Error: TransactionIdMismatch");
-    }
+    assert_eq!(response_tid, request_tid, "Transaction ID mismatch");
 
     // Read and validate response protocol ID
     let response_pid = u16::from_be_bytes([response_mbap[2], response_mbap[3]]);
-    if response_pid != request_pid {
-        eprintln!("Error: InvalidProtocolId");
-    }
+    assert_eq!(response_pid, 0, "Invalid protocol ID");
 
     // Read and validate unit ID
     let response_uid = response_mbap[6];
-    if response_uid != request_uid {
-        eprintln!("Error: UnitIdMismatch");
-    }
+    assert_eq!(response_uid, request_uid, "Unit ID mismatch");
 
     // Read and validate function code
     let response_fc = response_pdu[0];
-    if response_fc != request_fc && response_fc != (request_fc | 0x80) {
-        eprintln!("Error: FunctionCodeMismatch")
-    }
+    assert!(response_fc == request_fc || response_fc == (request_fc | 0x80));
 
     // success or exception
     match response_fc {
         // success route
         0x01..=0x04 => {
-            if response_pdu.len() < 2 {
-                eprintln!("Error: PduTruncated");
-            }
             let response_byte_count = response_pdu[1];
 
             // validate response function code
-            match response_fc {
-                0x01..=0x02 => {
-                    if response_byte_count as u16 != request_quantity.div_ceil(8) {
-                        eprintln!("Error: ByteCountMismatched");
-                    }
-                }
-                0x03..=0x04 => {
-                    if response_byte_count as u16 != request_quantity * 2 {
-                        eprintln!("Error: ByteCountMismatched");
-                    }
-                }
-                _ => {
-                    eprintln!("Error: Unsupported function code");
-                }
-            }
+            let expected_byte_count = match request_fc {
+                0x01 | 0x02 => usize::from(request_quantity.div_ceil(8)),
+                0x03 | 0x04 => usize::from(request_quantity) * 2,
+                _ => unreachable!(),
+            };
+            assert_eq!(usize::from(response_byte_count), expected_byte_count);
+            assert_eq!(response_pdu_len, 2 + expected_byte_count);
 
             let data_len = response_pdu_len - 2;
-            if response_byte_count as usize != data_len {
-                eprintln!("Error: ActualDataLenMismatchByteCount")
-            }
 
             let response_data = &response_pdu[2..response_pdu_len];
             match response_fc {
@@ -145,7 +130,9 @@ fn main() {
                 }
             }
         }
+        // exception route
         0x81..=0x84 => {
+            assert_eq!(response_pdu_len, 2);
             println!("Process Modbus exception")
         }
         _ => {
