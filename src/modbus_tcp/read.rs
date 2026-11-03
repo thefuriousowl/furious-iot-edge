@@ -204,3 +204,881 @@ pub fn try_read_once(
         },
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    use crate::modbus_tcp::{
+        ReadRequestDefinition,
+        error::{ModbusException, ModbusTcpError, ValidationError},
+        try_read_once,
+    };
+
+    fn read_request_builder(tid: u16, uid: u8, fc: u8, start: u16, qty: u16) -> [u8; 12] {
+        let mut request = [0u8; 12];
+        request[0..2].copy_from_slice(&tid.to_be_bytes());
+        request[2..4].copy_from_slice(&(0u16).to_be_bytes());
+        request[4..6].copy_from_slice(&(6u16).to_be_bytes()); // request mbap length
+        request[6] = uid;
+        request[7] = fc;
+        request[8..10].copy_from_slice(&start.to_be_bytes());
+        request[10..12].copy_from_slice(&qty.to_be_bytes());
+        request
+    }
+
+    fn read_response_builder(tid: u16, uid: u8, fc: u8, response_data: &[u8]) -> Vec<u8> {
+        let byte_count = response_data.len() as u8;
+        let mut response = Vec::new();
+        response.extend_from_slice(&tid.to_be_bytes());
+        response.extend_from_slice(&(0u16).to_be_bytes());
+        response.extend_from_slice(&(3 + (byte_count as u16)).to_be_bytes()); // response mbap length
+        response.push(uid);
+        response.push(fc);
+        response.push(byte_count);
+        response.extend_from_slice(response_data);
+        response
+    }
+
+    fn exception_response_builder(tid: u16, uid: u8, fc: u8, exception_code: u8) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&tid.to_be_bytes());
+        response.extend_from_slice(&(0u16).to_be_bytes());
+        response.extend_from_slice(&(3u16).to_be_bytes()); // exception mbap length always 3 if exception occurs
+        response.push(uid);
+        response.push(fc | 0x80);
+        response.push(exception_code);
+
+        response
+    }
+
+    fn create_tcp_test_server(
+        f: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind local test server");
+        let addr = listener.local_addr().expect("should return local address");
+
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("should accept client connection");
+            f(stream)
+        });
+        (addr, server_thread)
+    }
+
+    // happy path test
+    #[test]
+    fn read_coils_returns_expected_bytes_and_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 1, 0, 10);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 1, &[0x55, 0x01]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 0,
+            quantity: 10,
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 10);
+        assert_eq!(result.bytes_data(), &[0x55, 0x01]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn read_discrete_inputs_returns_expected_bytes_and_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 2, 0, 10);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 2, &[0x55, 0x01]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x02,
+            starting_address: 0,
+            quantity: 10,
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 10);
+        assert_eq!(result.bytes_data(), &[0x55, 0x01]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn read_holding_registers_returns_expected_bytes_and_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.bytes_data(), &[0x12, 0x34, 0x56, 0x78]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn read_input_registers_returns_expected_bytes_and_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 4, 0, 2);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 4, &[0x12, 0x34, 0x56, 0x78]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x04,
+            starting_address: 0,
+            quantity: 2,
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.bytes_data(), &[0x12, 0x34, 0x56, 0x78]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // response validation
+    #[test]
+    fn rejects_mismatch_tid() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(8, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::TransactionIdMismatch { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_mismatch_pid() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2); // received pid 0
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            actual_response[2..4].copy_from_slice(&(1u16).to_be_bytes()); // << wrong word here: send invalid pid 1
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidProtocolId { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_mismatch_uid() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2); // received uid 1
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            actual_response[6] = 2; // << wrong byte here: send invalid uid 2
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::UnitIdMismatch { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_mismatch_fc() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2); // received fc 3
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            actual_response[7] = 4; // << wrong byte here: send invalid fc 4
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::FunctionCodeMismatch { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_mismatch_byte_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2); // received qty 2 byte_count should be 4
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            actual_response[8] = 5; // << wrong byte here: send invalid byte_count 5
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::ByteCountMismatched { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn returns_device_exception() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2); // received qty 2 byte_count should be 4
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = exception_response_builder(7, 1, 3, 2);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Exception(ModbusException::IllegalDataAddress)
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // request validation
+    // should rejects invalid request before send to server
+    #[test]
+    fn rejects_unexpected_fc() {
+        let (server_addr, server_thread) = create_tcp_test_server(|_| {
+            // should rejects before test server process it
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x05,
+            starting_address: 0,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::UnexpectedFunctionCode { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_zero_qty() {
+        let (server_addr, server_thread) = create_tcp_test_server(|_| {
+            // should rejects before test server process it
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        // register
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 0,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+            ),
+            "{expected_error:?}"
+        );
+        // coil
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 0,
+            quantity: 0,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_exceeded_qty() {
+        let (server_addr, server_thread) = create_tcp_test_server(|_| {
+            // should rejects before test server process it
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        // register
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 126,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+            ),
+            "{expected_error:?}"
+        );
+        // coil
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 0,
+            quantity: 2001,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_exceeded_read_address() {
+        let (server_addr, server_thread) = create_tcp_test_server(|_| {
+            // should rejects before test server process it
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        // register
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 65535,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::AddressOutOfRange { .. })
+            ),
+            "{expected_error:?}"
+        );
+        // coil
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 65535,
+            quantity: 2,
+        };
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::AddressOutOfRange { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // happy path boundary validation
+
+    #[test]
+    fn accepts_max_coil_qty() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 1, 0, 2000);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 1, &[255u8; 250]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 0,
+            quantity: 2000, // max coil qty allowed
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 2000);
+        assert_eq!(result.bytes_data(), &[255u8; 250]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn accepts_max_register_qty() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 125);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 3, &[255u8; 250]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 125,
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 125);
+        assert_eq!(result.bytes_data(), &[255u8; 250]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn accept_max_coil_address() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 1, 65535, 1);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 1, &[255u8]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x01,
+            starting_address: 65535,
+            quantity: 1, // max coil qty allowed
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.bytes_data(), &[255u8; 1]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn accept_max_register_address() {
+        let (server_addr, server_thread) = create_tcp_test_server(|mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 65535, 1);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34]);
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 65535,
+            quantity: 1, // max register qty allowed
+        };
+
+        let result =
+            try_read_once(&mut client_stream, &definition, 7).expect("read should succeed");
+
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.bytes_data(), &[0x12, 0x34]);
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // validate response frame structure
+    #[test]
+    fn rejects_invalid_response_mbap_length() {
+        for bad_mbap_length in [2u16, 255] {
+            let (server_addr, server_thread) = create_tcp_test_server(move |mut server_stream| {
+                let expected_request = read_request_builder(7, 1, 3, 0, 2);
+                let mut actual_request = [0u8; 12];
+                server_stream
+                    .read_exact(&mut actual_request)
+                    .expect("read request from client");
+
+                assert_eq!(expected_request, actual_request);
+                let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+                actual_response[4..6].copy_from_slice(&bad_mbap_length.to_be_bytes()); // wrong word here as mbap length = 2 and 255
+                server_stream
+                    .write_all(&actual_response)
+                    .expect("should write response");
+            });
+
+            let mut client_stream =
+                TcpStream::connect(server_addr).expect("should connect to test server");
+            let definition = ReadRequestDefinition {
+                unit_id: 1,
+                function_code: 0x03,
+                starting_address: 0,
+                quantity: 2,
+            };
+
+            let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+            assert!(
+                matches!(
+                    expected_error,
+                    ModbusTcpError::Validation(ValidationError::InvalidMbapLength { found, .. }) if found == bad_mbap_length
+                ),
+                "{expected_error:?}"
+            );
+
+            server_thread.join().expect("server thread panicked");
+        }
+    }
+
+    #[test]
+    fn rejects_exception_response_pdu_len() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = exception_response_builder(7, 1, 3, 2);
+            actual_response[4..6].copy_from_slice(&4u16.to_be_bytes());
+            actual_response.extend_from_slice(&[0x12]); // add another 1 byte to make pdu len wrong
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::InvalidExceptionPduLen { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn rejects_data_len_mismatch_from_byte_count() {
+        let (server_addr, server_thread) = create_tcp_test_server(move |mut server_stream| {
+            let expected_request = read_request_builder(7, 1, 3, 0, 2);
+            let mut actual_request = [0u8; 12];
+            server_stream
+                .read_exact(&mut actual_request)
+                .expect("read request from client");
+
+            assert_eq!(expected_request, actual_request);
+            let mut actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+            actual_response[4..6].copy_from_slice(&9u16.to_be_bytes());
+            actual_response.extend_from_slice(&[0x56, 0x78]);
+
+            server_stream
+                .write_all(&actual_response)
+                .expect("should write response");
+        });
+
+        let mut client_stream =
+            TcpStream::connect(server_addr).expect("should connect to test server");
+        let definition = ReadRequestDefinition {
+            unit_id: 1,
+            function_code: 0x03,
+            starting_address: 0,
+            quantity: 2,
+        };
+
+        let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+        assert!(
+            matches!(
+                expected_error,
+                ModbusTcpError::Validation(ValidationError::ActualDataLenMismatchByteCount { .. })
+            ),
+            "{expected_error:?}"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // io error
+    #[test]
+    fn rejects_connection_closed_in_flight() {
+        for truncated_index in [5, 9] {
+            let (server_addr, server_thread) = create_tcp_test_server(move |mut server_stream| {
+                let expected_request = read_request_builder(7, 1, 3, 0, 2);
+                let mut actual_request = [0u8; 12];
+                server_stream
+                    .read_exact(&mut actual_request)
+                    .expect("read request from client");
+
+                assert_eq!(expected_request, actual_request);
+                let actual_response = read_response_builder(7, 1, 3, &[0x12, 0x34, 0x56, 0x78]);
+
+                server_stream
+                    .write_all(&actual_response[..truncated_index])
+                    .expect("should write response");
+
+                drop(server_stream);
+            });
+
+            let mut client_stream =
+                TcpStream::connect(server_addr).expect("should connect to test server");
+            let definition = ReadRequestDefinition {
+                unit_id: 1,
+                function_code: 0x03,
+                starting_address: 0,
+                quantity: 2,
+            };
+
+            let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
+            assert!(
+                matches!(expected_error, ModbusTcpError::Io(_)),
+                "cut at {truncated_index}: {expected_error:?}"
+            );
+
+            server_thread.join().expect("server thread panicked");
+        }
+    }
+}
