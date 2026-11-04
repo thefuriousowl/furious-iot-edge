@@ -1,5 +1,3 @@
-use crate::modbus_tcp::MultipleWriteValues::{Coils, Registers};
-
 pub struct ReadRequestDefinition {
     pub unit_id: u8,
     pub function_code: u8,

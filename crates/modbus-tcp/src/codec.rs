@@ -1,4 +1,4 @@
-use crate::modbus_tcp::read::{MBAP_HEADER_LEN, MODBUS_TCP_PID};
+use crate::read::{MBAP_HEADER_LEN, MODBUS_TCP_PID};
 
 pub(crate) fn assemble_read_request_pdu(
     function_code: u8,

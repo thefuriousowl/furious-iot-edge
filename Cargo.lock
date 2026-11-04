@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "furious-iot-edge"
 version = "0.1.0"
+dependencies = [
+ "furious-modbus-tcp",
+]
+
+[[package]]
+name = "furious-modbus-tcp"
+version = "0.1.0"

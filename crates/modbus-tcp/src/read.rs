@@ -3,12 +3,12 @@ use std::{
     net::TcpStream,
 };
 
-use crate::modbus_tcp::{
+use crate::{
     codec::{assemble_read_request_pdu, assemble_request_adu, assemble_request_mbap},
     definition::ReadRequestDefinition,
     error::{
-        ModbusTcpError::{self, Validation},
-        ValidationError,
+        ModbusTcpError::{self},
+        RequestError, ResponseError, SyncError,
     },
     helper::ensure,
 };
@@ -57,15 +57,13 @@ pub fn try_read_once(
         0x01 | 0x02 => 2000,
         0x03 | 0x04 => 125,
         fc => {
-            return Err(Validation(ValidationError::UnexpectedFunctionCode {
-                found: fc,
-            }));
+            return Err(RequestError::UnexpectedFunctionCode { found: fc }.into());
         }
     };
 
     ensure(
         (1..=max_quantity).contains(&definition.quantity),
-        ValidationError::InvalidQuantity {
+        RequestError::InvalidQuantity {
             min: 1,
             max: max_quantity,
             found: definition.quantity,
@@ -75,11 +73,12 @@ pub fn try_read_once(
     let check_range_add = u32::from(definition.starting_address) + u32::from(definition.quantity);
 
     if check_range_add > 65536 {
-        return Err(Validation(ValidationError::AddressOutOfRange {
+        return Err(RequestError::AddressOutOfRange {
             min: 1,
             max: 65535,
             found: check_range_add,
-        }));
+        }
+        .into());
     }
 
     let request_pdu = assemble_read_request_pdu(
@@ -99,7 +98,7 @@ pub fn try_read_once(
     let response_length = u16::from_be_bytes([response_mbap[4], response_mbap[5]]);
     ensure(
         (3..=254).contains(&response_length),
-        ValidationError::InvalidMbapLength {
+        SyncError::InvalidMbapLength {
             min: 3,
             max: 254,
             found: response_length,
@@ -114,7 +113,7 @@ pub fn try_read_once(
     let response_tid = u16::from_be_bytes([response_mbap[0], response_mbap[1]]);
     ensure(
         response_tid == request_tid,
-        ValidationError::TransactionIdMismatch {
+        SyncError::TransactionIdMismatch {
             expected: request_tid,
             found: response_tid,
         },
@@ -124,7 +123,7 @@ pub fn try_read_once(
     let response_pid = u16::from_be_bytes([response_mbap[2], response_mbap[3]]);
     ensure(
         response_pid == MODBUS_TCP_PID,
-        ValidationError::InvalidProtocolId {
+        ResponseError::InvalidProtocolId {
             expected: MODBUS_TCP_PID,
             found: response_pid,
         },
@@ -134,7 +133,7 @@ pub fn try_read_once(
     let response_uid = response_mbap[6];
     ensure(
         response_uid == definition.unit_id,
-        ValidationError::UnitIdMismatch {
+        ResponseError::UnitIdMismatch {
             expected: definition.unit_id,
             found: response_uid,
         },
@@ -146,7 +145,7 @@ pub fn try_read_once(
     if response_fc == exception_fc {
         ensure(
             response_pdu_len == 2,
-            ValidationError::InvalidExceptionPduLen {
+            ResponseError::InvalidExceptionPduLen {
                 expected: 2,
                 found: response_pdu_len,
             },
@@ -157,7 +156,7 @@ pub fn try_read_once(
 
     ensure(
         response_fc == definition.function_code,
-        ValidationError::FunctionCodeMismatch {
+        ResponseError::FunctionCodeMismatch {
             request: definition.function_code,
             response: response_fc,
         },
@@ -176,7 +175,7 @@ pub fn try_read_once(
 
     ensure(
         usize::from(response_byte_count) == expected_byte_count,
-        ValidationError::ByteCountMismatched {
+        ResponseError::ByteCountMismatched {
             expected: expected_byte_count as u16,
             found: u16::from(response_byte_count),
         },
@@ -184,7 +183,7 @@ pub fn try_read_once(
 
     ensure(
         data_len == usize::from(response_byte_count),
-        ValidationError::ActualDataLenMismatchByteCount {
+        ResponseError::ActualDataLenMismatchByteCount {
             byte_count: usize::from(response_byte_count),
             data_len,
         },
@@ -213,9 +212,13 @@ mod tests {
         thread,
     };
 
-    use crate::modbus_tcp::{
+    use crate::{
         ReadRequestDefinition,
-        error::{ModbusException, ModbusTcpError, ValidationError},
+        error::{
+            ModbusException,
+            ModbusTcpError::{Exception, Io, Request, Response, Sync},
+            RequestError, ResponseError, SyncError,
+        },
         try_read_once,
     };
 
@@ -435,11 +438,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::TransactionIdMismatch { .. })
+                Sync(SyncError::TransactionIdMismatch { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(!expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -472,11 +475,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidProtocolId { .. })
+                Response(ResponseError::InvalidProtocolId { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -509,11 +512,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::UnitIdMismatch { .. })
+                Response(ResponseError::UnitIdMismatch { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -546,11 +549,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::FunctionCodeMismatch { .. })
+                Response(ResponseError::FunctionCodeMismatch { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -583,11 +586,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::ByteCountMismatched { .. })
+                Response(ResponseError::ByteCountMismatched { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -619,11 +622,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Exception(ModbusException::IllegalDataAddress)
+                Exception(ModbusException::IllegalDataAddress)
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -647,11 +650,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::UnexpectedFunctionCode { .. })
+                Request(RequestError::UnexpectedFunctionCode { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -674,10 +677,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+                Request(RequestError::InvalidQuantity { .. })
             ),
             "{expected_error:?}"
         );
+        assert!(expected_error.is_connection_reusable());
         // coil
         let definition = ReadRequestDefinition {
             unit_id: 1,
@@ -689,11 +693,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+                Request(RequestError::InvalidQuantity { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -716,10 +720,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+                Request(RequestError::InvalidQuantity { .. })
             ),
             "{expected_error:?}"
         );
+        assert!(expected_error.is_connection_reusable());
         // coil
         let definition = ReadRequestDefinition {
             unit_id: 1,
@@ -731,10 +736,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidQuantity { .. })
+                Request(RequestError::InvalidQuantity { .. })
             ),
             "{expected_error:?}"
         );
+        assert!(expected_error.is_connection_reusable());
 
         server_thread.join().expect("server thread panicked");
     }
@@ -758,10 +764,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::AddressOutOfRange { .. })
+                Request(RequestError::AddressOutOfRange { .. })
             ),
             "{expected_error:?}"
         );
+        assert!(expected_error.is_connection_reusable());
         // coil
         let definition = ReadRequestDefinition {
             unit_id: 1,
@@ -773,10 +780,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::AddressOutOfRange { .. })
+                Request(RequestError::AddressOutOfRange { .. })
             ),
             "{expected_error:?}"
         );
+        assert!(expected_error.is_connection_reusable());
 
         server_thread.join().expect("server thread panicked");
     }
@@ -954,11 +962,11 @@ mod tests {
             assert!(
                 matches!(
                     expected_error,
-                    ModbusTcpError::Validation(ValidationError::InvalidMbapLength { found, .. }) if found == bad_mbap_length
+                    Sync(SyncError::InvalidMbapLength { found, .. }) if found == bad_mbap_length
                 ),
                 "{expected_error:?}"
             );
-
+            assert!(!expected_error.is_connection_reusable());
             server_thread.join().expect("server thread panicked");
         }
     }
@@ -994,11 +1002,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::InvalidExceptionPduLen { .. })
+                Response(ResponseError::InvalidExceptionPduLen { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -1034,11 +1042,11 @@ mod tests {
         assert!(
             matches!(
                 expected_error,
-                ModbusTcpError::Validation(ValidationError::ActualDataLenMismatchByteCount { .. })
+                Response(ResponseError::ActualDataLenMismatchByteCount { .. })
             ),
             "{expected_error:?}"
         );
-
+        assert!(expected_error.is_connection_reusable());
         server_thread.join().expect("server thread panicked");
     }
 
@@ -1074,10 +1082,10 @@ mod tests {
 
             let expected_error = try_read_once(&mut client_stream, &definition, 7).unwrap_err();
             assert!(
-                matches!(expected_error, ModbusTcpError::Io(_)),
+                matches!(expected_error, Io(_)),
                 "cut at {truncated_index}: {expected_error:?}"
             );
-
+            assert!(!expected_error.is_connection_reusable());
             server_thread.join().expect("server thread panicked");
         }
     }
