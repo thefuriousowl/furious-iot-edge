@@ -25,7 +25,7 @@ pub enum ValidationError {
     ActualDataLenMismatchByteCount { byte_count: usize, data_len: usize },
     InvalidExceptionPduLen { expected: usize, found: usize },
     InvalidWriteResponsePduLen { expected: usize, found: usize },
-    WriteResponseMismatch,
+    WriteResponseMismatch { expected: [u8; 5], found: [u8; 5] },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

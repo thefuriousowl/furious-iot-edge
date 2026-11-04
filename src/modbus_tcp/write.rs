@@ -137,13 +137,16 @@ pub fn try_write_single_once(
         },
     )?;
 
-    ensure(
-        response_pdu[..response_pdu_len] == request_pdu,
-        ValidationError::WriteResponseMismatch {
-            expected: Vec::from(&request_pdu),
-            found: Vec::from(&response_pdu[..response_pdu_len]),
-        },
-    )?;
+    if response_pdu[..5] != request_pdu {
+        let mut found = [0u8; 5];
+        found.copy_from_slice(&response_pdu[..5]);
+        return Err(ModbusTcpError::Validation(
+            ValidationError::WriteResponseMismatch {
+                expected: request_pdu, // already [u8; 5] from assemble_single_write_request_pdu
+                found,
+            },
+        ));
+    }
 
     Ok(WriteAck::new(response_uid, definition.starting_address, 1))
 }
@@ -306,13 +309,15 @@ pub fn try_write_multiple_once(
         },
     )?;
 
-    ensure(
-        response_pdu[..response_pdu_len] == request_pdu[..5],
-        ValidationError::WriteResponseMismatch {
-            expected: Vec::from(&response_pdu[..response_pdu_len]),
-            found: Vec::from(&request_pdu[..5]),
-        },
-    )?;
+    if response_pdu[..5] != request_pdu[..5] {
+        let mut expected = [0u8; 5];
+        expected.copy_from_slice(&request_pdu[..5]); // request_pdu here is a slice
+        let mut found = [0u8; 5];
+        found.copy_from_slice(&response_pdu[..5]);
+        return Err(ModbusTcpError::Validation(
+            ValidationError::WriteResponseMismatch { expected, found },
+        ));
+    }
 
     Ok(WriteAck::new(
         response_uid,
@@ -587,7 +592,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(7, 1, 15, 0, expected_qty as u16);
             server_stream
@@ -631,7 +635,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(7, 1, 16, 0, expected_qty as u16);
@@ -819,7 +822,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(7, 1, 15, 0, expected_qty as u16);
             server_stream
@@ -861,7 +863,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(7, 1, 16, 0, expected_qty as u16);
@@ -906,7 +907,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let actual_response =
                 multiple_write_response_builder(7, 1, 15, 65535, expected_qty as u16);
@@ -950,7 +950,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let actual_response =
@@ -1075,7 +1074,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(8, 1, 15, 0, expected_qty as u16);
             server_stream
@@ -1121,7 +1119,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let actual_response = multiple_write_response_builder(8, 1, 16, 0, expected_qty as u16);
@@ -1248,7 +1245,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let mut actual_response =
                 multiple_write_response_builder(7, 1, 15, 0, expected_qty as u16);
@@ -1296,7 +1292,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let mut actual_response =
@@ -1425,7 +1420,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let mut actual_response =
                 multiple_write_response_builder(7, 1, 15, 0, expected_qty as u16);
@@ -1473,7 +1467,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let mut actual_response =
@@ -1602,7 +1595,6 @@ mod tests {
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
 
-
             assert_eq!(expected_request, actual_request);
             let mut actual_response =
                 multiple_write_response_builder(7, 1, 15, 0, expected_qty as u16);
@@ -1650,7 +1642,6 @@ mod tests {
             server_stream
                 .read_exact(&mut actual_request)
                 .expect("read request from client");
-
 
             assert_eq!(expected_request, actual_request);
             let mut actual_response =

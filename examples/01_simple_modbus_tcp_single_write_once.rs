@@ -33,7 +33,7 @@ fn main() {
     let request_tid: u16 = 1;
     let request_pid: u16 = 0;
     let request_uid: u8 = 1;
-    let request_mbap_length: u16 = 6; // << Always 6 on modbus tcp read
+    let request_mbap_length: u16 = 6;
     let mut request_mbap = [0u8; MBAP_HEADER_LEN];
     request_mbap[0..2].copy_from_slice(&request_tid.to_be_bytes());
     request_mbap[2..4].copy_from_slice(&request_pid.to_be_bytes());
